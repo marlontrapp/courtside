@@ -14,6 +14,7 @@ class ReservationAdmin(admin.ModelAdmin):
         "status",
         "includes_lighting",
         "total_price",
+        "cancelled_at",
         "created_at",
     )
     list_filter = (
@@ -32,6 +33,6 @@ class ReservationAdmin(admin.ModelAdmin):
     )
     raw_id_fields = ("court", "primary_player")
     filter_horizontal = ("guests",)
-    readonly_fields = ("created_at", "updated_at", "total_price")
+    readonly_fields = ("created_at", "updated_at", "total_price", "cancelled_at")
     date_hierarchy = "start_datetime"
     ordering = ("-start_datetime",)

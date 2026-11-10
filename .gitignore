@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local PostgreSQL test cluster (scripts/test_env.sh)
+.pgdata/
+.redisdata/
+
+# Local aligner dumps
+aligner/

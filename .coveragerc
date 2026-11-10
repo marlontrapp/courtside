@@ -1,0 +1,27 @@
+# coverage.py configuration — used by `make coverage`.
+[run]
+source =
+    apps
+    config
+branch = True
+omit =
+    */migrations/*
+    */tests/*
+    config/asgi.py
+    config/wsgi.py
+    config/settings_test.py
+
+[report]
+show_missing = True
+skip_empty = True
+precision = 1
+sort = Cover
+exclude_also =
+    if TYPE_CHECKING:
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    @(abc\.)?abstractmethod
+
+[html]
+directory = htmlcov
+title = CourtControl coverage

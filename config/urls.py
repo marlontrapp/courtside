@@ -2,7 +2,7 @@
 
 from django.contrib import admin
 from django.http import JsonResponse
-from django.urls import path
+from django.urls import include, path
 
 
 def healthcheck(_request):
@@ -12,6 +12,10 @@ def healthcheck(_request):
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("health/", healthcheck, name="healthcheck"),
+    path("api/v1/", include("apps.courts.urls")),
+    path("api/v1/", include("apps.bookings.urls")),
+    # Session login/logout for any user (not just staff) + browsable API login link.
+    path("api-auth/", include("rest_framework.urls")),
 ]
 
 admin.site.site_header = "CourtControl Administration"

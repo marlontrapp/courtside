@@ -34,6 +34,7 @@ INSTALLED_APPS = [
     "corsheaders",
     "django_celery_beat",
     # Local apps
+    "apps.common",
     "apps.users",
     "apps.courts",
     "apps.bookings",
@@ -95,6 +96,10 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 AUTH_USER_MODEL = "users.User"
+
+# Where /api-auth/login/ sends users when no ?next= is given
+# (Django's default, /accounts/profile/, does not exist here).
+LOGIN_REDIRECT_URL = "courts:court-list"
 
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "America/Sao_Paulo"

@@ -18,3 +18,5 @@ htmlcov
 *.md
 .idea
 .vscode
+.pgdata
+.redisdata

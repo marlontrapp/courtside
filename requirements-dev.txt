@@ -1,0 +1,5 @@
+# Development & test tooling (not installed in the production image).
+-r requirements.txt
+
+# Test coverage (make coverage)
+coverage>=7.6,<8

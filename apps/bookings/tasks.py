@@ -52,6 +52,37 @@ def send_booking_confirmation_task(reservation_id: str) -> dict:
     }
 
 
+@shared_task(name="apps.bookings.tasks.send_booking_cancellation_task")
+def send_booking_cancellation_task(reservation_id: str) -> dict:
+    """
+    Simulate notifying the booker and guests that a booking was cancelled.
+
+    Replace the logging stubs with real providers when integrations are ready.
+    """
+    from .models import Reservation
+
+    try:
+        reservation = (
+            Reservation.objects.select_related("court", "court__club", "primary_player")
+            .prefetch_related("guests")
+            .get(pk=reservation_id)
+        )
+    except Reservation.DoesNotExist:
+        logger.error("Cancellation notice skipped: reservation %s not found", reservation_id)
+        return {"ok": False, "reason": "not_found"}
+
+    recipients = [reservation.primary_player.email]
+    recipients += [guest.email for guest in reservation.guests.all()]
+    for email in recipients:
+        logger.info(
+            "[email] Cancellation notice → %s | court=%s | was=%s",
+            email,
+            reservation.court,
+            reservation.start_datetime.isoformat(),
+        )
+    return {"ok": True, "reservation_id": str(reservation.id), "notified": recipients}
+
+
 @shared_task(name="apps.bookings.tasks.expire_unpaid_reservations_task")
 def expire_unpaid_reservations_task() -> dict:
     """
