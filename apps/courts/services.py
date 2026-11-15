@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.db.models import Q, QuerySet
 from django.utils import timezone
@@ -38,7 +39,8 @@ from .models import (
     ScheduleOverride,
     Weekday,
 )
-from .schedule import Slot, booking_error, club_today, resolve_slots, validate_day_slots
+from .schedule import Slot, booking_error, club_today, format_slot, resolve_slots, validate_day_slots
+from .tasks import send_club_decision_task, send_club_review_request_task
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +57,15 @@ _SLUG_SUFFIX_ROOM = 8  # room for a "-<n>" suffix within the column length
 _SLUG_CREATE_ATTEMPTS = 3
 
 
-def register_club(*, name: str, address: str) -> Club:
+class ClubRegistrationLimit(Exception):
+    """The user already has settings.CLUB_REGISTRATION_MAX_PENDING clubs awaiting approval. -> 429."""
+
+
+class ClubReviewError(Exception):
+    """An approval / rejection that doesn't apply to the club's state. -> 409."""
+
+
+def register_club(*, name: str, address: str, registered_by=None) -> Club:
     """
     Create a club from the minimum registration data: name and address.
 
@@ -63,21 +73,100 @@ def register_club(*, name: str, address: str) -> Club:
     starts at its model default and is meant to be changed later by editing
     the club.
 
+    Self-service: a club registered by a player (`registered_by`, not staff)
+    starts PENDING — hidden from players until site staff approve it
+    (approve_club) — and its registrant becomes its club admin, so they can
+    set it up meanwhile. At most settings.CLUB_REGISTRATION_MAX_PENDING
+    pending clubs per user (ClubRegistrationLimit). Registered by staff, or
+    without a user (staff tools): approved right away.
+
     Club names need not be unique, but slugs are — see `unique_club_slug`.
     The slug is chosen with one lookup before inserting; the unique
     constraint stays the final guard, and a concurrent registration taking
     the same slug between the lookup and the insert is retried.
     """
+    self_service = registered_by is not None and not registered_by.is_staff
+    with transaction.atomic():
+        if self_service:
+            _check_pending_limit(registered_by)
+        club = _create_club(name, address, registered_by)
+        if self_service:
+            ClubStaffRole.objects.create(
+                user=registered_by, club=club, role=ClubStaffRole.Role.ADMIN, start_date=club_today(club)
+            )
+            transaction.on_commit(lambda: send_club_review_request_task.delay(str(club.pk)))
+    return club
+
+
+def _check_pending_limit(user) -> None:
+    from apps.users.models import User  # users depends on courts
+
+    User.objects.select_for_update().get(pk=user.pk)  # one registration per user at a time
+    pending = Club.objects.filter(registered_by=user, approval_status=Club.ApprovalStatus.PENDING).count()
+    if pending >= settings.CLUB_REGISTRATION_MAX_PENDING:
+        raise ClubRegistrationLimit(
+            f"You already have {pending} clubs awaiting approval; wait until they're reviewed."
+        )
+
+
+def _create_club(name: str, address: str, registered_by) -> Club:
+    approved = registered_by is None or registered_by.is_staff
+    status = Club.ApprovalStatus.APPROVED if approved else Club.ApprovalStatus.PENDING
+    review = {"reviewed_by": registered_by, "reviewed_at": timezone.now()} if registered_by and approved else {}
     error: IntegrityError | None = None
     for _attempt in range(_SLUG_CREATE_ATTEMPTS):
         slug = unique_club_slug(name, address)
         try:
             # Savepoint: a slug collision must not break the outer (request) transaction.
             with transaction.atomic():
-                return Club.objects.create(name=name, address=address, slug=slug)
+                return Club.objects.create(
+                    name=name, address=address, slug=slug,
+                    approval_status=status, registered_by=registered_by, **review,
+                )
         except IntegrityError as exc:
             error = exc
     raise error
+
+
+@transaction.atomic
+def approve_club(club: Club, *, by) -> Club:
+    """Make a pending (or rejected) club live; its registrant is emailed."""
+    club = Club.objects.select_for_update().get(pk=club.pk)
+    if club.approval_status == Club.ApprovalStatus.APPROVED:
+        raise ClubReviewError("This club is already approved.")
+    return _review(club, Club.ApprovalStatus.APPROVED, by=by, reason="")
+
+
+@transaction.atomic
+def reject_club(club: Club, *, by, reason: str) -> Club:
+    """Reject a pending club (it stays hidden); its registrant is emailed the reason."""
+    club = Club.objects.select_for_update().get(pk=club.pk)
+    if club.approval_status != Club.ApprovalStatus.PENDING:
+        raise ClubReviewError(
+            "Only clubs awaiting approval can be rejected (to hide an approved club, deactivate it)."
+        )
+    if not reason.strip():
+        raise ClubReviewError("Give the reason for the rejection: it's sent to whoever registered the club.")
+    return _review(club, Club.ApprovalStatus.REJECTED, by=by, reason=reason.strip())
+
+
+def _review(club: Club, status: str, *, by, reason: str) -> Club:
+    club.approval_status, club.rejection_reason = status, reason
+    club.reviewed_by, club.reviewed_at = by, timezone.now()
+    club.save(update_fields=["approval_status", "rejection_reason", "reviewed_by", "reviewed_at", "updated_at"])
+    transaction.on_commit(lambda: send_club_decision_task.delay(str(club.pk)))
+    return club
+
+
+def get_visible_club(user, pk) -> Club | None:
+    """
+    A club `user` may view: an approved one (any logged-in user; even if
+    inactive), or a pending / rejected one they administer (or site staff).
+    """
+    club = Club.objects.filter(pk=pk).first()
+    if club is None or club.is_approved:
+        return club
+    return club if get_administered_clubs(user).filter(pk=pk).exists() else None
 
 
 def unique_club_slug(name: str, address: str) -> str:
@@ -152,7 +241,7 @@ def can_access_club(user, club: Club) -> bool:
 
 def can_book_court(user, court: Court) -> bool:
     """True if the court is bookable and the user has access to its club."""
-    if not (court.is_active and court.club.is_active):
+    if not (court.is_active and court.club.is_live):
         return False
     return can_access_club(user, court.club)
 
@@ -273,20 +362,33 @@ class ScheduleInUse(ScheduleError):
     """The change would rewrite history or remove something still referenced. -> 409."""
 
 
+class LinkedToRules(ScheduleInUse):
+    """A court / day template / slot is linked to booking rules (and force wasn't set). -> 409."""
+
+    def __init__(self, message: str, rules):
+        self.rules = list(rules)
+        super().__init__(message)
+
+
 class ScheduleConflict(Exception):
     """Future bookings wouldn't fit the new slots (and force wasn't set). -> 409."""
 
-    def __init__(self, reservations):
+    def __init__(self, reservations, message: str | None = None, hint: str | None = None):
         self.reservations = reservations
-        super().__init__(f"{len(reservations)} future booking(s) wouldn't fit the new schedule.")
+        self.hint = hint or "Pick a later start date, or send force=true to cancel these bookings."
+        super().__init__(message or f"{len(reservations)} future booking(s) wouldn't fit the new schedule.")
 
 
 @dataclass
 class ScheduleChange:
-    """Result of a schedule change: what was created/updated, and bookings cancelled by force."""
+    """
+    Result of a schedule change: what was created/updated, bookings cancelled
+    by force, and booking rules unlinked by force (apps.bookings.rules.UnlinkReport).
+    """
 
     result: object = None
     cancelled: list = field(default_factory=list)
+    rules: object = None
 
 
 def _future_bookings(courts, date_from: date, date_to: date | None):
@@ -400,16 +502,19 @@ def update_day_template(
                 "This template has already been in effect, so its slots are part of the schedule "
                 "history and can't change. Create a new template and schedule it from a date."
             )
+        removed = [slot for slot in template.slots.all() if (slot.start_time, slot.end_time) not in set(slots)]
+        if not force:
+            _check_not_linked_to_rules(removed)
+    unlinked = None
 
     def change():
+        nonlocal unlinked
         if name is not None:
             template.name = name
             template.save(update_fields=["name", "updated_at"])
         if slots is not None:
-            template.slots.all().delete()
-            DayTemplateSlot.objects.bulk_create(
-                DayTemplateSlot(template=template, start_time=start, end_time=end) for start, end in sorted(slots)
-            )
+            unlinked = _unlink(slots=removed)
+            _replace_slots(template, slots)
         return template
 
     if slots is None:
@@ -417,13 +522,136 @@ def update_day_template(
     users = Court.objects.filter(
         Q(schedules__days__day_template=template) | Q(schedule_overrides__day_template=template)
     ).distinct()
-    return _apply(users, change, date_from=club_today(template.club), force=force)
+    result = _apply(users, change, date_from=club_today(template.club), force=force)
+    result.rules = unlinked
+    return result
 
 
-def delete_day_template(template: DayTemplate) -> None:
+def _replace_slots(template: DayTemplate, slots: list[Slot]) -> None:
+    """
+    Make the template's slots `slots`: unchanged slots are kept (with their ids,
+    so booking rules linked to them stay linked), removed ones deleted, new ones added.
+    """
+    wanted = set(slots)
+    existing = {(slot.start_time, slot.end_time): slot for slot in template.slots.all()}
+    # Delete first: new slots may overlap removed ones (exclusion constraint).
+    DayTemplateSlot.objects.filter(pk__in=[slot.pk for key, slot in existing.items() if key not in wanted]).delete()
+    DayTemplateSlot.objects.bulk_create(
+        DayTemplateSlot(template=template, start_time=start, end_time=end)
+        for start, end in sorted(wanted - set(existing))
+    )
+
+
+_FORCE_UNLINK_HINT = (
+    "Unlink it from the rule(s), or send force=true: the links are removed, and a rule left "
+    "without any link of that kind is deactivated (rather than covering more)."
+)
+
+
+def _linked_rules(**links):
+    from apps.bookings.rules import linked_rules  # bookings depends on courts
+
+    return list(linked_rules(**links))
+
+
+def _unlink(**links):
+    from apps.bookings.rules import unlink_from_rules  # bookings depends on courts
+
+    return unlink_from_rules(**links)
+
+
+def _check_not_linked_to_rules(slots) -> None:
+    """Slots linked to booking rules are only removed with force (see _FORCE_UNLINK_HINT)."""
+    rules = _linked_rules(slots=slots) if slots else []
+    if rules:
+        linked = sorted({format_slot((s.start_time, s.end_time)) for s in slots if s.booking_rules.exists()})
+        raise LinkedToRules(
+            f"Slot(s) {', '.join(linked)} are linked to booking rule(s): {', '.join(r.name for r in rules)}.", rules
+        )
+
+
+@transaction.atomic
+def delete_day_template(template: DayTemplate, *, force: bool = False):
+    """
+    Delete an unused template. Linked to booking rules (itself or its slots):
+    LinkedToRules, or with force=True unlinked first — returns the UnlinkReport.
+    """
     if CourtScheduleDay.objects.filter(day_template=template).exists() or template.overrides.exists():
         raise ScheduleInUse("This template is used by a schedule or an override, so it can't be deleted.")
+    slots = list(template.slots.all())
+    rules = _linked_rules(day_templates=[template], slots=slots)
+    if rules and not force:
+        raise LinkedToRules(
+            f"This template is linked to booking rule(s): {', '.join(r.name for r in rules)}.", rules
+        )
+    report = _unlink(day_templates=[template], slots=slots) if rules else None
     template.delete()
+    return report
+
+
+# Courts (club admins and site staff) -------------------------------------------------
+
+
+class CourtHasBookings(ScheduleInUse):
+    """A court with bookings (history) can't be deleted — deactivate it instead. -> 409."""
+
+
+def create_court(club: Club, **fields) -> Court:
+    """A new court of `club` (pending clubs too: their admins set them up before approval)."""
+    return Court.objects.create(club=club, **fields)
+
+
+@transaction.atomic
+def update_court(court: Court, fields: dict, *, force: bool = False) -> ScheduleChange:
+    """
+    Change a court's settings. Deactivating it with future bookings (not
+    started, pending or confirmed) is refused — ScheduleConflict listing them
+    — unless force=True, which cancels them (like schedule changes).
+    Other changes never affect existing bookings (their price and lighting
+    are kept; a court becoming singles-only keeps its doubles).
+    """
+    from apps.bookings.models import Reservation  # bookings depends on courts
+
+    Court.objects.select_for_update().filter(pk=court.pk).first()
+    cancelled = []
+    if court.is_active and fields.get("is_active") is False:
+        upcoming = _future_bookings([court], club_today(court.club), None)
+        if upcoming and not force:
+            raise ScheduleConflict(
+                upcoming, f"{len(upcoming)} future booking(s) on this court: deactivating it would leave them "
+                          "without a court.",
+                hint="Send force=true to cancel these bookings, or deactivate the court after them.",
+            )
+        if upcoming:
+            Reservation.objects.filter(pk__in=[b.pk for b in upcoming]).update(
+                status=Reservation.Status.CANCELLED, updated_at=timezone.now()
+            )
+            for booking in upcoming:
+                booking.status = Reservation.Status.CANCELLED
+            cancelled = upcoming
+            logger.info("Deactivating court %s cancelled %d booking(s)", court.pk, len(upcoming))
+    for name, value in fields.items():
+        setattr(court, name, value)
+    court.save()
+    return ScheduleChange(result=court, cancelled=cancelled)
+
+
+@transaction.atomic
+def delete_court(court: Court, *, force: bool = False):
+    """
+    Delete a court. One with bookings (any status: they're history) can't be
+    — CourtHasBookings: deactivate it instead. Linked to booking rules:
+    LinkedToRules, or with force=True unlinked first (a rule left without a
+    court link is deactivated) — returns the UnlinkReport.
+    """
+    if court.reservations.exists():
+        raise CourtHasBookings("This court has bookings (its history), so it can't be deleted: deactivate it instead.")
+    rules = _linked_rules(courts=[court])
+    if rules and not force:
+        raise LinkedToRules(f"This court is linked to booking rule(s): {', '.join(r.name for r in rules)}.", rules)
+    report = _unlink(courts=[court]) if rules else None
+    court.delete()
+    return report
 
 
 # Weekly schedule versions -------------------------------------------------------------

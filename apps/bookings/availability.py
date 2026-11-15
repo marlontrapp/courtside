@@ -13,6 +13,11 @@ Slots a one-time override removes (a tournament, maintenance, weather, …)
 don't exist that day; the override's type and notes are reported as the
 court's *notices* so members can see why.
 
+Each slot lists the club's booking rules that cover it (apps.bookings.rules
+— e.g. "Women only", "Max 2 bookings per week"); the court lists those rules
+once, with a summary. Whether the requesting player meets them isn't
+evaluated here: it's checked when booking.
+
 Dates and times are interpreted as wall-clock values in each club's own
 timezone; returned datetimes are timezone-aware in that zone.
 
@@ -25,7 +30,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from datetime import timezone as dt_timezone
 from uuid import UUID
@@ -37,6 +42,7 @@ from apps.courts.models import Court
 from apps.courts.schedule import END_OF_DAY, resolve
 
 from .models import Reservation
+from .rules import RuleInfo, active_rules, covering_rules, rule_summary
 
 MAX_WINDOW_DAYS = 7
 
@@ -47,6 +53,7 @@ Interval = tuple[datetime, datetime]
 class TimeSlot:
     start: datetime
     end: datetime
+    rules: tuple = ()  # ids of the booking rules covering the slot
 
 
 @dataclass(frozen=True)
@@ -62,6 +69,7 @@ class Notice:
 class CourtSlots:
     available: list[TimeSlot]
     notices: list[Notice]
+    rules: list[RuleInfo] = field(default_factory=list)  # every rule the slots refer to
 
 
 @dataclass(frozen=True)
@@ -123,18 +131,24 @@ def get_courts_slots(
 
     resolved = resolve(courts, window.date_from, window.date_to)
     reserved_by_court = _reserved(courts, window)
+    rules_by_club = active_rules({court.club_id for court in courts})
 
     result: dict[UUID, CourtSlots] = {}
     for court in courts:
         tz = ZoneInfo(court.club.timezone)
-        available = [
-            TimeSlot(start=start, end=end)
-            for day in window.days()
-            for start, end in _future_slots_in_window(day, resolved.slots[court.id][day], tz, window, now)
-            if not _overlaps_any(start, end, reserved_by_court[court.id])
-        ]
+        club_rules = rules_by_club[court.club_id]
+        available, used_rules = [], {}
+        for day in window.days():
+            for start, end in _future_slots_in_window(day, resolved.slots[court.id][day], tz, window, now):
+                if _overlaps_any(start, end, reserved_by_court[court.id]):
+                    continue
+                template_id, slot_ids = resolved.covered(court.id, day, start.time(), end.time())
+                covering = covering_rules(club_rules, court.id, day, template_id, slot_ids)
+                used_rules.update((rule.pk, rule) for rule in covering)
+                available.append(TimeSlot(start=start, end=end, rules=tuple(rule.pk for rule in covering)))
         notices = [Notice(date=o.date, type=o.type, notes=o.notes) for o in resolved.overrides[court.id]]
-        result[court.id] = CourtSlots(available=available, notices=notices)
+        rules = [RuleInfo(id=r.pk, name=r.name, kind=r.kind, summary=rule_summary(r)) for r in used_rules.values()]
+        result[court.id] = CourtSlots(available=available, notices=notices, rules=rules)
     return result
 
 

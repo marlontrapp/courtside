@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 from django.utils import timezone
 
-from apps.bookings.models import Reservation
+from apps.bookings.models import BookingRule, Reservation
 from apps.courts.models import (
     Club,
     ClubMembership,
@@ -222,3 +222,31 @@ def create_reservation(
     extra.setdefault("status", Reservation.Status.CONFIRMED)
     extra.setdefault("total_price", Decimal("100.00"))
     return Reservation.objects.create(court=court, primary_player=primary_player, **extra)
+
+
+def create_booking_rule(
+    club: Club | None = None,
+    kind: str = "booking_types",
+    params: dict | None = None,
+    *,
+    courts: Iterable[Court] = (),
+    day_templates: Iterable[DayTemplate] = (),
+    slots: Iterable[DayTemplateSlot] = (),
+    **extra,
+) -> BookingRule:
+    """
+    A booking rule with params validated (and normalized) by its kind, linked
+    to `courts` / `day_templates` / `slots` (none = the whole club), e.g.
+    create_booking_rule(club, "player_gender", {"allowed": ["FEMALE"]}, slots=evening_slots).
+    """
+    from apps.bookings.rules import RULE_KINDS
+
+    club = club or create_club()
+    if params is None:
+        params = {"allowed": ["DOUBLES"]} if kind == "booking_types" else {}
+    extra.setdefault("name", f"Rule {_seq()}")
+    rule = BookingRule.objects.create(club=club, kind=kind, params=RULE_KINDS[kind].validate_params(params), **extra)
+    rule.courts.set(courts)
+    rule.day_templates.set(day_templates)
+    rule.slots.set(slots)
+    return rule

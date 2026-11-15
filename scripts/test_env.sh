@@ -28,7 +28,9 @@
 #                      `run` does this automatically (SEED=0 to skip)
 #   deps               Create .venv and install requirements.txt (cached)
 #   test [labels...]   Run the Django test suite; extra args go to `manage.py test`
-#   smoke [args...]    Smoke-test the `run` stack over HTTP (club registration),
+#   openapi            Generate the OpenAPI schema from the views into docs/openapi.yaml
+#   smoke [args...]    Smoke-test the `run` stack over HTTP (club registration; searches,
+#                      pictures, booking rules, bookings with guests — see smoke_api),
 #                      starting it first if it isn't running (and stopping it
 #                      after); cleans up its own data; extra args go to the command
 #   db-start           Init (first run) and start the local PostgreSQL cluster
@@ -90,6 +92,7 @@ PG_HOST="127.0.0.1"
 PG_PORT="${PG_PORT:-54329}"
 PG_USER="${PG_USER:-courtcontrol}"
 PG_DB="${PG_DB:-courtcontrol}"
+OPENAPI_FILE="${OPENAPI_FILE:-docs/openapi.yaml}"
 PG_BIN="${PG_BIN:-}"
 TEST_SETTINGS="${TEST_SETTINGS:-config.settings_test}"
 KEEP_DB_RUNNING="${KEEP_DB_RUNNING:-0}"
@@ -389,11 +392,26 @@ cmd_db_start() {
         ok "Database '$PG_DB' created"
     fi
 
-    # Reservation's ExclusionConstraint needs btree_gist (PostgreSQL contrib).
-    if [[ "$(psql_admin "SELECT 1 FROM pg_available_extensions WHERE name = 'btree_gist'")" != "1" ]]; then
-        die "PostgreSQL extension 'btree_gist' is not available.
+    # Contrib extensions the migrations create: btree_gist (exclusion constraints),
+    # pg_trgm + unaccent (club/player search).
+    local ext
+    for ext in btree_gist pg_trgm unaccent; do
+        if [[ "$(psql_admin "SELECT 1 FROM pg_available_extensions WHERE name = '$ext'")" != "1" ]]; then
+            die "PostgreSQL extension '$ext' is not available.
     Install the contrib package (Debian/Ubuntu: postgresql-contrib, RHEL: postgresql<ver>-contrib)."
-    fi
+        fi
+    done
+}
+
+# With --keepdb, Django migrates the kept test database but reuses the parallel
+# workers' clones (test_<db>_1, _2, ...) as they are: after a new migration they
+# lack its tables and tests fail (often as "cannot pickle 'traceback' object").
+# Drop them; they're re-cloned from the migrated test database in seconds.
+drop_parallel_test_clones() {
+    local clone
+    for clone in $(psql_admin "SELECT datname FROM pg_database WHERE datname ~ '^test_${PG_DB}_[0-9]+\$'"); do
+        psql_admin "DROP DATABASE IF EXISTS \"$clone\" WITH (FORCE)" >/dev/null
+    done
 }
 
 cmd_db_stop() {
@@ -705,6 +723,11 @@ cmd_run() {
     else
         warn "redis-server not found — starting WITHOUT Celery worker/beat."
         warn "Install it with 'make install-redis' (or set REDIS_BIN) to run the full stack."
+        # No broker: run tasks (e.g. booking notifications) inline in the web process
+        # instead of blocking every dispatch while Celery retries Redis.
+        warn "Celery tasks run inline in the web process (CELERY_TASK_ALWAYS_EAGER); periodic tasks don't run."
+        export CELERY_TASK_ALWAYS_EAGER=True
+        export CACHE_URL="locmem://"  # the auth rate limits use the cache
     fi
 
     if [[ ! -f .env ]]; then
@@ -775,6 +798,10 @@ cmd_test() {
     export DATABASE_URL
     DATABASE_URL="$(database_url)"
 
+    if [[ " $* " == *" --keepdb "* && " $* " == *" --parallel"* ]]; then
+        drop_parallel_test_clones
+    fi
+
     info "Running tests (settings=$TEST_SETTINGS${*:+, args: $*})"
     local rc=0
     # --noinput: never prompt (e.g. to drop a test DB left by a --keepdb run),
@@ -783,6 +810,16 @@ cmd_test() {
 
     if [[ "$rc" -eq 0 ]]; then ok "Tests passed"; else warn "Tests failed (exit $rc)"; fi
     return "$rc"
+}
+
+cmd_openapi() {
+    # The OpenAPI schema is generated from the views (drf-spectacular); it
+    # fails on any warning so the file never documents a half-understood view.
+    cmd_deps
+    [[ -f .env ]] || export DJANGO_DEBUG="${DJANGO_DEBUG:-True}"
+    mkdir -p "$(dirname "$OPENAPI_FILE")"
+    "$VENV_DIR/bin/python" manage.py spectacular --file "$OPENAPI_FILE" --validate --fail-on-warn
+    ok "Wrote $OPENAPI_FILE"
 }
 
 cmd_install_postgres() {
@@ -866,8 +903,14 @@ cmd_smoke() {
     DATABASE_URL="$(database_url)"
     [[ -f .env ]] || export DJANGO_DEBUG="${DJANGO_DEBUG:-True}"
 
+    # Both smoke tests run even if the first fails; the exit code is the first failure's.
     SMOKE_RC=0
-    "$VENV_DIR/bin/python" manage.py smoke_club_registration --base-url "$base_url" "$@" || SMOKE_RC=$?
+    local smoke_cmd rc
+    for smoke_cmd in smoke_club_registration smoke_api; do
+        rc=0
+        "$VENV_DIR/bin/python" manage.py "$smoke_cmd" --base-url "$base_url" "$@" || rc=$?
+        if [[ "$SMOKE_RC" -eq 0 ]]; then SMOKE_RC="$rc"; fi
+    done
     return "$SMOKE_RC"
 }
 
@@ -992,6 +1035,7 @@ main() {
         deps)             cmd_deps ;;
         test)             cmd_test "$@" ;;
         smoke)            cmd_smoke "$@" ;;
+        openapi)          cmd_openapi "$@" ;;
         db-start)         cmd_db_start ;;
         db-stop)          cmd_db_stop ;;
         db-status)        cmd_db_status ;;

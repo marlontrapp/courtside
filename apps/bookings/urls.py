@@ -2,7 +2,13 @@
 
 from django.urls import path
 
-from .views import ReservationCancelView, ReservationListCreateView
+from .views import (
+    BookingRuleDetailView,
+    BookingRuleKindsView,
+    BookingRuleListView,
+    ReservationCancelView,
+    ReservationListCreateView,
+)
 
 app_name = "bookings"
 
@@ -13,4 +19,7 @@ urlpatterns = [
         ReservationCancelView.as_view(),
         name="reservation-cancel",
     ),
+    path("clubs/<uuid:club_pk>/booking-rules/", BookingRuleListView.as_view(), name="booking-rule-list"),
+    path("clubs/<uuid:club_pk>/booking-rules/<uuid:pk>/", BookingRuleDetailView.as_view(), name="booking-rule-detail"),
+    path("booking-rule-kinds/", BookingRuleKindsView.as_view(), name="booking-rule-kinds"),
 ]

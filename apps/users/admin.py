@@ -60,13 +60,42 @@ class UserAdmin(DjangoUserAdmin):
 class PlayerProfileAdmin(admin.ModelAdmin):
     list_display = (
         "user",
+        "full_name",
+        "location",
         "phone_number",
         "skill_level",
-        "is_member",
-        "membership_tier",
+        "dominant_hand",
+        "backhand_style",
         "updated_at",
     )
-    list_filter = ("is_member", "membership_tier", "skill_level")
-    search_fields = ("user__email", "phone_number")
+    list_filter = (
+        "skill_level",
+        "gender",
+        "dominant_hand",
+        "backhand_style",
+        "preferred_surface",
+    )
+    search_fields = ("user__email", "user__first_name", "user__last_name", "phone_number", "location", "racket")
+    list_select_related = ("user",)
     raw_id_fields = ("user",)
     readonly_fields = ("created_at", "updated_at")
+    fieldsets = (
+        (None, {"fields": ("user", "phone_number", "birth_date", "gender", "location", "picture_key")}),
+        (
+            _("Game"),
+            {
+                "fields": (
+                    "skill_level",
+                    "dominant_hand",
+                    "backhand_style",
+                    "racket",
+                    "preferred_surface",
+                ),
+            },
+        ),
+        (_("Important dates"), {"fields": ("created_at", "updated_at")}),
+    )
+
+    @admin.display(description=_("name"), ordering="user__first_name")
+    def full_name(self, obj: PlayerProfile) -> str:
+        return obj.full_name

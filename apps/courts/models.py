@@ -6,15 +6,17 @@ from decimal import Decimal
 from django.conf import settings
 from django.contrib.postgres.constraints import ExclusionConstraint
 from django.contrib.postgres.fields import DateRangeField, DateTimeRangeField, RangeOperators
+from django.contrib.postgres.indexes import GinIndex
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import Exists, Func, OuterRef, Q
-from django.db.models.functions import Lower
+from django.db.models.functions import Concat, Lower
 from django.utils import timezone
 from django.utils.text import slugify
 from django.utils.translation import gettext_lazy as _
 
 from apps.common.models import TimeStampedUUIDModel
+from apps.common.search import SearchNormalize
 
 
 def _has_active_membership(user, club_ref: str) -> Exists:
@@ -30,7 +32,8 @@ def _is_anonymous(user) -> bool:
 
 class ClubQuerySet(models.QuerySet):
     def active(self):
-        return self.filter(is_active=True)
+        """Live clubs: active and approved (self-registered clubs are hidden until approved)."""
+        return self.filter(is_active=True, approval_status=Club.ApprovalStatus.APPROVED)
 
     def accessible_to(self, user):
         """Open clubs, plus members-only clubs where `user` has an active membership."""
@@ -46,6 +49,13 @@ class Club(TimeStampedUUIDModel):
     class AccessType(models.TextChoices):
         OPEN = "OPEN", _("Open to all players")
         MEMBERS_ONLY = "MEMBERS_ONLY", _("Members only")
+
+    class ApprovalStatus(models.TextChoices):
+        """Self-registered clubs start PENDING: hidden until site staff approve them."""
+
+        PENDING = "PENDING", _("Awaiting approval")
+        APPROVED = "APPROVED", _("Approved")
+        REJECTED = "REJECTED", _("Rejected")
 
     name = models.CharField(max_length=255)
     slug = models.SlugField(max_length=255, unique=True)
@@ -69,6 +79,36 @@ class Club(TimeStampedUUIDModel):
         related_name="clubs",
         blank=True,
     )
+    # Self-service registration (courts.services.register_club) and its review.
+    # Clubs created by staff tools (admin, seed) are approved by default.
+    approval_status = models.CharField(
+        max_length=16, choices=ApprovalStatus.choices, default=ApprovalStatus.APPROVED,
+        help_text=_("Pending and rejected clubs are hidden from players (search, courts, booking)."),
+    )
+    registered_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="registered_clubs",
+    )
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="reviewed_clubs",
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    rejection_reason = models.CharField(
+        max_length=500, blank=True, help_text=_("Why the club wasn't approved (sent to whoever registered it)."),
+    )
+    # Club search (apps/courts/search.py): unaccented, lower-case copies of
+    # name/address, computed and kept up to date by PostgreSQL on every write;
+    # not meant to be read or set in Python. `name` and `address` themselves
+    # keep the text exactly as entered, accents included.
+    search_name = models.GeneratedField(
+        expression=SearchNormalize("name"),
+        output_field=models.TextField(),
+        db_persist=True,
+    )
+    search_document = models.GeneratedField(
+        expression=SearchNormalize(Concat("name", models.Value(" "), "address", output_field=models.TextField())),
+        output_field=models.TextField(),
+        db_persist=True,
+    )
 
     objects = ClubQuerySet.as_manager()
 
@@ -76,6 +116,27 @@ class Club(TimeStampedUUIDModel):
         ordering = ["name"]
         verbose_name = _("club")
         verbose_name_plural = _("clubs")
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(approval_status__in=["PENDING", "APPROVED", "REJECTED"]),
+                name="club_valid_approval_status",
+            ),
+        ]
+        indexes = [
+            # Trigram index: serves LIKE '%term%' on the search document.
+            # Partial — search only ever looks at live clubs (active and approved).
+            GinIndex(
+                fields=["search_document"],
+                opclasses=["gin_trgm_ops"],
+                condition=Q(is_active=True, approval_status="APPROVED"),
+                name="club_search_document_trgm",
+            ),
+            # The staff review queue (few rows). No plain index on approval_status:
+            # nearly every club is APPROVED, so it wouldn't narrow anything.
+            models.Index(
+                fields=["created_at"], condition=Q(approval_status="PENDING"), name="club_pending_review_queue",
+            ),
+        ]
 
     def __str__(self) -> str:
         return self.name
@@ -83,6 +144,15 @@ class Club(TimeStampedUUIDModel):
     @property
     def requires_membership(self) -> bool:
         return self.access_type == self.AccessType.MEMBERS_ONLY
+
+    @property
+    def is_approved(self) -> bool:
+        return self.approval_status == self.ApprovalStatus.APPROVED
+
+    @property
+    def is_live(self) -> bool:
+        """Shown to players and bookable: active and approved."""
+        return self.is_active and self.is_approved
 
     def save(self, *args, **kwargs):
         if not self.slug:
@@ -92,8 +162,10 @@ class Club(TimeStampedUUIDModel):
 
 class CourtQuerySet(models.QuerySet):
     def bookable(self):
-        """Courts that are active and belong to an active club."""
-        return self.filter(is_active=True, club__is_active=True)
+        """Courts that are active and belong to a live club (active and approved)."""
+        return self.filter(
+            is_active=True, club__is_active=True, club__approval_status=Club.ApprovalStatus.APPROVED
+        )
 
     def accessible_to(self, user):
         """Courts of open clubs, plus members-only clubs where `user` is an active member."""
@@ -120,6 +192,14 @@ class Court(TimeStampedUUIDModel):
         default=SurfaceType.CLAY,
     )
     is_indoor = models.BooleanField(default=False)
+    is_singles_only = models.BooleanField(
+        default=False,
+        help_text=_(
+            "A singles court (e.g. too narrow for doubles): bookings can't be doubles and take "
+            "at most 2 players — the booker and 1 guest."
+        ),
+    )
+    MAX_SINGLES_PLAYERS = 2  # on a singles court: the booker + 1 guest
     has_lighting = models.BooleanField(default=True)
     hourly_rate = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal("0.00"))
     lighting_fee = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal("0.00"))

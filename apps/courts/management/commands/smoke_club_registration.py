@@ -1,16 +1,18 @@
 """
 python manage.py smoke_club_registration [--base-url URL] [--timeout S] [--force]
 
-Smoke test of the club registration and editing flow against a *running*
-instance: real HTTP, session login with CSRF, JSON API — then verifies what
-the server stored by reading the same database.
+Smoke test of the club registration, review and editing flow against a
+*running* instance: real HTTP, session login with CSRF, JSON API — then
+verifies what the server stored by reading the same database. Self-registered
+clubs await approval (hidden from others), their registrant is their club
+admin, and site staff approve / reject them.
 
 The command must use the same database as the server (same DATABASE_URL):
 it creates the test user there and cleans up there. Everything it creates is
 marked, so cleanup never touches other data:
 
-  * user  SMOKE_EMAIL (".invalid" is a reserved TLD — no real user has it),
-    created with a fresh random password on every run;
+  * users SMOKE_EMAIL and SMOKE_OTHER_EMAIL (".invalid" is a reserved TLD —
+    no real user has it), created with fresh random passwords on every run;
   * clubs named exactly SMOKE_CLUB_NAME;
   * the smoke user's login sessions.
 
@@ -22,18 +24,17 @@ time per database.
 from __future__ import annotations
 
 import secrets
-from datetime import timedelta
 
 from django.conf import settings
-from django.contrib.auth import SESSION_KEY
 from django.contrib.sessions.models import Session
 from django.core.management.base import BaseCommand, CommandError
 
-from apps.common.smoke import SmokeClient, SmokeFailure, check
-from apps.courts.models import Club
+from apps.common.smoke import SmokeClient, SmokeFailure, check, sessions_of
+from apps.courts.models import Club, ClubStaffRole
 from apps.users.models import User
 
 SMOKE_EMAIL = "smoke-test@courtcontrol.invalid"
+SMOKE_OTHER_EMAIL = "smoke-test-other@courtcontrol.invalid"  # not the registrant
 SMOKE_CLUB_NAME = "Smoke Test Club (courtcontrol-smoke)"
 SMOKE_ADDRESS = "Smoke Street, 1"
 
@@ -48,6 +49,10 @@ SLUG_NUMBERED = f"{SLUG_BY_NAME_AND_ADDRESS}-2"
 
 def smoke_clubs():
     return Club.objects.filter(name=SMOKE_CLUB_NAME)
+
+
+def smoke_users():
+    return User.objects.filter(email__in=[SMOKE_EMAIL, SMOKE_OTHER_EMAIL])
 
 
 def model_default(field: str):
@@ -102,11 +107,11 @@ class Command(BaseCommand):
             interrupted = True
         finally:
             self._cleanup()
-            remaining = smoke_clubs().count() + User.objects.filter(email=SMOKE_EMAIL).count()
+            remaining = smoke_clubs().count() + smoke_users().count()
             if remaining:  # never expected; say so loudly rather than leave data silently
                 self.stderr.write(self.style.ERROR(f"  ✖ cleanup left {remaining} smoke rows behind"))
             else:
-                self._ok("cleanup: smoke user, clubs and session removed")
+                self._ok("cleanup: smoke users, clubs and sessions removed")
 
         if interrupted:
             raise CommandError("Smoke test interrupted.", returncode=130)
@@ -149,17 +154,22 @@ class Command(BaseCommand):
             expected_slug=SLUG_BY_NAME,
         )
         self._check_defaults(first)
-        self._ok(f"registered club -> slug {SLUG_BY_NAME!r}, defaults applied, extra fields ignored")
+        check(first["approval_status"] == "PENDING", f"a self-registered club awaits approval: {first}")
+        check(ClubStaffRole.objects.current().filter(
+            club_id=first["id"], user__email=SMOKE_EMAIL, role=ClubStaffRole.Role.ADMIN).exists(),
+            "the registrant isn't the club's admin")
+        self._ok(f"registered club -> slug {SLUG_BY_NAME!r}, PENDING, registrant is its club admin, "
+                 "defaults applied, extra fields ignored")
 
         self._register({"name": SMOKE_CLUB_NAME, "address": SMOKE_ADDRESS},
                        expected_slug=SLUG_BY_NAME_AND_ADDRESS)
         self._ok(f"same name -> slug {SLUG_BY_NAME_AND_ADDRESS!r}")
 
-        self._register({"name": SMOKE_CLUB_NAME, "address": SMOKE_ADDRESS},
-                       expected_slug=SLUG_NUMBERED)
+        third = self._register({"name": SMOKE_CLUB_NAME, "address": SMOKE_ADDRESS},
+                               expected_slug=SLUG_NUMBERED)
         self._ok(f"same name + address -> slug {SLUG_NUMBERED!r}")
 
-        self._check_edit(first["id"])
+        self._check_edit_and_review(first["id"], third["id"])
 
         for body, field in [
             ({"name": SMOKE_CLUB_NAME}, "address"),
@@ -195,22 +205,29 @@ class Command(BaseCommand):
               f"stored club differs from the response: {stored.name!r}, {stored.address!r}, {stored.slug!r}")
         return data
 
-    def _check_edit(self, club_id: str):
-        """PATCH /api/v1/clubs/<id>/: staff-only; every field but name/address."""
+    def _check_edit_and_review(self, club_id: str, other_club_id: str):
+        """
+        The registrant (its club admin) edits the pending club; another user
+        can't see it; site staff reject one club and approve the other; then
+        everyone sees the approved one, but only its admins edit it.
+        """
         club_path = f"{CLUBS_PATH}{club_id}/"
+        other = SmokeClient(self.client.base_url, timeout=self.client.timeout)
+        password = secrets.token_urlsafe(24)
+        User.objects.create_user(email=SMOKE_OTHER_EMAIL, password=password)
+        check(other.login(SMOKE_OTHER_EMAIL, password).status == 302, "second smoke user can't log in")
+        self.other = other
 
-        response = self.client.request("PATCH", club_path, json_body={"is_active": False}, csrf=True)
-        check(response.status == 403, f"edit by a non-staff user should be 403, got {response.describe()}")
-        self._ok("edit by a non-staff user is rejected (403)")
+        response = other.get(club_path)
+        check(response.status == 404, f"another user should not see a pending club, got {response.describe()}")
+        self._ok("a pending club is hidden from other users (404)")
 
-        # Takes effect on the next request — no extra login (the session only holds the user id).
-        User.objects.filter(email=SMOKE_EMAIL).update(is_staff=True)
         response = self.client.request(
             "PATCH", club_path,
             json_body={"timezone": "Europe/Lisbon", "cancellation_window_hours": 1},
             csrf=True,
         )
-        check(response.status == 200, f"staff edit should be 200, got {response.describe()}")
+        check(response.status == 200, f"club admin edit should be 200, got {response.describe()}")
         data = response.json()
         check(
             (data.get("timezone"), data.get("cancellation_window_hours"), data.get("name"))
@@ -222,7 +239,7 @@ class Command(BaseCommand):
             (stored.timezone, stored.cancellation_window_hours) == ("Europe/Lisbon", 1),
             f"edit wasn't stored: {stored.timezone!r}, {stored.cancellation_window_hours}",
         )
-        self._ok("staff edit is applied and stored")
+        self._ok("the registrant (club admin) edits the pending club; stored")
 
         response = self.client.request("PATCH", club_path, json_body={"name": "Hijacked"}, csrf=True)
         check(
@@ -232,12 +249,29 @@ class Command(BaseCommand):
         check(Club.objects.get(pk=club_id).name == SMOKE_CLUB_NAME, "the name was changed")
         self._ok("editing name/address is rejected (400, points at support)")
 
-        response = self.client.get(club_path)
+        # Site staff review. Takes effect on the next request — no extra login
+        # (the session only holds the user id).
+        User.objects.filter(email=SMOKE_EMAIL).update(is_staff=True)
+        response = self.client.get(f"{CLUBS_PATH}pending/")
+        pending = [c["id"] for c in response.json().get("results", [])] if response.status == 200 else []
+        check({club_id, other_club_id} <= set(pending), f"staff pending queue: {response.describe()}")
+        response = self.client.post_json(f"{CLUBS_PATH}{other_club_id}/reject/", {"reason": "Smoke test"})
+        check(response.status == 200 and response.json()["approval_status"] == "REJECTED",
+              f"reject: {response.describe()}")
+        response = self.client.post_json(f"{CLUBS_PATH}{club_id}/approve/", {})
+        check(response.status == 200 and Club.objects.get(pk=club_id).approval_status == Club.ApprovalStatus.APPROVED,
+              f"approve: {response.describe()}")
+        self._ok("staff: GET /clubs/pending/, POST …/reject/ (with a reason), POST …/approve/")
+        User.objects.filter(email=SMOKE_EMAIL).update(is_staff=False)
+
+        response = other.get(club_path)
         check(
             response.status == 200 and response.json().get("timezone") == "Europe/Lisbon",
-            f"GET after edit: {response.describe()}",
+            f"GET of the approved club: {response.describe()}",
         )
-        self._ok("GET reflects the edit (any authenticated user)")
+        response = other.request("PATCH", club_path, json_body={"is_active": False}, csrf=True)
+        check(response.status == 403, f"edit by a non-admin should be 403, got {response.describe()}")
+        self._ok("approved: any user sees it (with the edit); only its admins edit it (403 for others)")
 
     def _check_defaults(self, data: dict):
         expected = {
@@ -253,10 +287,11 @@ class Command(BaseCommand):
 
     def _cleanup(self) -> str:
         """Delete everything this smoke test owns. Returns a summary of what was removed."""
-        users = list(User.objects.filter(email=SMOKE_EMAIL))
-        session_keys = {key for user in users for key in self._sessions_of(user)}
-        if self.client.session_key:
-            session_keys.add(self.client.session_key)
+        users = list(smoke_users())
+        session_keys = {key for user in users for key in sessions_of(user)}
+        for client in (self.client, getattr(self, "other", None)):
+            if client is not None and client.session_key:
+                session_keys.add(client.session_key)
 
         counts = {
             "session": Session.objects.filter(pk__in=session_keys).delete()[0],
@@ -264,21 +299,6 @@ class Command(BaseCommand):
             "user": User.objects.filter(pk__in=[u.pk for u in users]).delete()[1].get("users.User", 0),
         }
         return ", ".join(f"{n} {what}{'s' if n != 1 else ''}" for what, n in counts.items() if n)
-
-    @staticmethod
-    def _sessions_of(user: User) -> list[str]:
-        """
-        Session keys of a leftover smoke user (from a run killed before its cleanup).
-
-        Sessions can only be matched by decoding them, so first narrow down by
-        time: they were created right after the user, hence expire around
-        date_joined + SESSION_COOKIE_AGE (indexed column; 1h of slack).
-        """
-        earliest = user.date_joined + timedelta(seconds=settings.SESSION_COOKIE_AGE)
-        candidates = Session.objects.filter(
-            expire_date__gte=earliest, expire_date__lt=earliest + timedelta(hours=1)
-        )
-        return [s.pk for s in candidates if s.get_decoded().get(SESSION_KEY) == str(user.pk)]
 
     def _ok(self, message: str):
         if self.verbose:

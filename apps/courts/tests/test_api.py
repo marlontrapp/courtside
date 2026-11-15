@@ -82,8 +82,8 @@ class ResponseShapeTests(CourtListAPITestCase):
         self.assertEqual(
             set(court),
             {
-                "id", "name", "surface_type", "is_indoor", "has_lighting",
-                "hourly_rate", "lighting_fee", "club", "available_slots", "notices",
+                "id", "name", "surface_type", "is_indoor", "is_singles_only", "has_lighting",
+                "hourly_rate", "lighting_fee", "club", "available_slots", "notices", "booking_rules",
             },
         )
         self.assertEqual(
@@ -98,8 +98,9 @@ class ResponseShapeTests(CourtListAPITestCase):
         )
         self.assertEqual(
             court["available_slots"][0],
-            {"start": "2030-01-08T08:00:00-03:00", "end": "2030-01-08T09:00:00-03:00"},
+            {"start": "2030-01-08T08:00:00-03:00", "end": "2030-01-08T09:00:00-03:00", "rules": []},
         )
+        self.assertEqual(court["booking_rules"], [])
 
 
 class AvailabilityWindowTests(CourtListAPITestCase):

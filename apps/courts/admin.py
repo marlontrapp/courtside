@@ -1,4 +1,6 @@
-from django.contrib import admin
+from django import forms
+from django.contrib import admin, messages
+from django.db.models import ProtectedError
 from django.forms.models import BaseInlineFormSet
 from django.utils.translation import gettext_lazy as _
 
@@ -13,6 +15,7 @@ from .models import (
     DayTemplateSlot,
     ScheduleOverride,
 )
+from .services import CourtHasBookings, approve_club, delete_court, reject_club
 
 
 class CourtInline(admin.TabularInline):
@@ -22,6 +25,7 @@ class CourtInline(admin.TabularInline):
         "name",
         "surface_type",
         "is_indoor",
+        "is_singles_only",
         "has_lighting",
         "hourly_rate",
         "lighting_fee",
@@ -108,22 +112,63 @@ class CourtScheduleDayInline(ReadOnlyAdminMixin, admin.TabularInline):
     extra = 0
 
 
+class ClubAdminForm(forms.ModelForm):
+    class Meta:
+        model = Club
+        fields = "__all__"
+
+    def clean(self):
+        cleaned = super().clean()
+        status = cleaned.get("approval_status")
+        if status and self.instance.pk and status != self.instance.approval_status:
+            if status == Club.ApprovalStatus.PENDING:
+                self.add_error("approval_status", _("A reviewed club can't go back to awaiting approval."))
+            if status == Club.ApprovalStatus.REJECTED and not (cleaned.get("rejection_reason") or "").strip():
+                self.add_error("rejection_reason", _("Give the reason: it's sent to whoever registered the club."))
+        return cleaned
+
+
 @admin.register(Club)
 class ClubAdmin(admin.ModelAdmin):
+    form = ClubAdminForm
     list_display = (
         "name",
         "slug",
+        "approval_status",
         "timezone",
         "access_type",
         "cancellation_window_hours",
         "is_active",
         "created_at",
     )
-    list_filter = ("is_active", "access_type", "timezone")
+    list_filter = ("approval_status", "is_active", "access_type", "timezone")
     search_fields = ("name", "slug", "address")
     prepopulated_fields = {"slug": ("name",)}
-    readonly_fields = ("created_at", "updated_at")
+    readonly_fields = ("created_at", "updated_at", "registered_by", "reviewed_by", "reviewed_at")
     inlines = (CourtInline, ClubMembershipInline, ClubStaffRoleInline)
+    actions = ["approve"]
+
+    @admin.action(description=_("Approve selected clubs"))
+    def approve(self, request, queryset):
+        approved = 0
+        for club in queryset.exclude(approval_status=Club.ApprovalStatus.APPROVED):
+            approve_club(club, by=request.user)
+            approved += 1
+        self.message_user(request, _("Approved %d club(s); their registrants are emailed.") % approved)
+
+    def save_model(self, request, obj, form, change):
+        """An approval decision goes through the service (review recorded, registrant emailed)."""
+        decided = change and "approval_status" in form.changed_data
+        if decided:
+            new_status, reason = obj.approval_status, obj.rejection_reason
+            obj.approval_status = form.initial["approval_status"]  # the other changes are saved as usual
+        super().save_model(request, obj, form, change)
+        if decided:
+            if new_status == Club.ApprovalStatus.APPROVED:
+                approve_club(obj, by=request.user)
+            else:
+                reject_club(obj, by=request.user, reason=reason)
+            obj.refresh_from_db()
 
 
 @admin.register(Court)
@@ -133,14 +178,41 @@ class CourtAdmin(admin.ModelAdmin):
         "club",
         "surface_type",
         "is_indoor",
+        "is_singles_only",
         "has_lighting",
         "hourly_rate",
         "is_active",
     )
-    list_filter = ("surface_type", "is_indoor", "has_lighting", "is_active", "club")
+    list_filter = ("surface_type", "is_indoor", "is_singles_only", "has_lighting", "is_active", "club")
     search_fields = ("name", "club__name")
     readonly_fields = ("created_at", "updated_at")
     inlines = (CourtScheduleInline,)
+    actions = ["force_delete"]
+
+    @admin.action(description=_("Delete selected courts, unlinking booking rules (force)"))
+    def force_delete(self, request, queryset):
+        """
+        The regular delete refuses courts linked to booking rules (it lists them).
+        This one unlinks them first; a rule left without any court link is
+        deactivated rather than covering every court.
+        """
+        for court in queryset.select_related("club"):
+            try:
+                report = delete_court(court, force=True)
+            except (CourtHasBookings, ProtectedError):
+                self.message_user(
+                    request, _("%s has reservations, so it can't be deleted (deactivate it instead).") % court,
+                    messages.ERROR,
+                )
+                continue
+            self.message_user(request, _("Deleted %s.") % court, messages.SUCCESS)
+            if report and report.deactivated:
+                self.message_user(
+                    request,
+                    _("Deactivated booking rule(s) left without a court: %s — relink and reactivate them if needed.")
+                    % ", ".join(rule.name for rule in report.deactivated),
+                    messages.WARNING,
+                )
 
 
 @admin.register(DayTemplate)

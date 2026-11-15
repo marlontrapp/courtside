@@ -26,7 +26,8 @@ class ClubDetailGetTests(APITestCase):
         self.assertEqual(
             set(response.data),
             {"id", "name", "slug", "address", "timezone", "access_type",
-             "cancellation_window_hours", "is_active", "created_at", "updated_at"},
+             "cancellation_window_hours", "is_active", "approval_status", "rejection_reason",
+             "created_at", "updated_at"},
         )
         self.assertEqual(response.data["name"], "Ace Club")
 
@@ -104,6 +105,8 @@ class ClubEditAPITests(APITestCase):
                 "access_type": "OPEN",
                 "cancellation_window_hours": 1,
                 "is_active": True,
+                "approval_status": "APPROVED",
+                "rejection_reason": "",
             },
         )
         self.assertEqual(created_at, self.club.created_at)

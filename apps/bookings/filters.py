@@ -1,13 +1,11 @@
 """Query-string filters for "my reservations" (django-filter)."""
 
-from functools import reduce
-from operator import or_
-
 from django import forms
 from django.db.models import Exists, OuterRef, Q
 from django_filters import rest_framework as filters
 
 from apps.common.filters import CharInFilter, ChoiceInFilter, UUIDInFilter
+from apps.users.references import parse_player_references
 
 from .models import Reservation
 
@@ -36,20 +34,26 @@ class ReservationFilter(filters.FilterSet):
 
     # When. ISO dates only: Django's locale formats would read 07/01/2030 as
     # July 1st (en-us), which is ambiguous for users writing DD/MM/YYYY.
-    date = filters.DateFilter(field_name="local_date", input_formats=ISO_DATE)
-    date_from = filters.DateFilter(field_name="local_date", lookup_expr="gte", input_formats=ISO_DATE)
-    date_to = filters.DateFilter(field_name="local_date", lookup_expr="lte", input_formats=ISO_DATE)
-    time_from = filters.TimeFilter(field_name="local_start_time", lookup_expr="gte")
-    time_to = filters.TimeFilter(field_name="local_end_time", lookup_expr="lte")
+    date = filters.DateFilter(field_name="local_date", input_formats=ISO_DATE, help_text="Bookings on that day.")
+    date_from = filters.DateFilter(field_name="local_date", lookup_expr="gte", input_formats=ISO_DATE,
+                                   help_text="On or after this day (inclusive; no range limit).")
+    date_to = filters.DateFilter(field_name="local_date", lookup_expr="lte", input_formats=ISO_DATE,
+                                 help_text="On or before this day (inclusive).")
+    time_from = filters.TimeFilter(field_name="local_start_time", lookup_expr="gte",
+                                   help_text="Starting at or after this time of day (HH:MM, club time).")
+    time_to = filters.TimeFilter(field_name="local_end_time", lookup_expr="lte",
+                                 help_text="Ending at or before this time of day (HH:MM, club time).")
 
     # What / where / who
-    state = ChoiceInFilter(field_name="state", choices=Reservation.State.choices, lookup_expr="in")
-    booking_type = ChoiceInFilter(choices=Reservation.BookingType.choices, lookup_expr="in")
-    club = UUIDInFilter(field_name="court__club_id", lookup_expr="in")
-    court = UUIDInFilter(field_name="court_id", lookup_expr="in")
-    player = CharInFilter(method="filter_player", help_text="Emails; booker or guest.")
+    state = ChoiceInFilter(field_name="state", choices=Reservation.State.choices, lookup_expr="in",
+                           help_text="Lifecycle states, derived from the status and the clock.")
+    booking_type = ChoiceInFilter(choices=Reservation.BookingType.choices, lookup_expr="in", help_text="Booking types.")
+    club = UUIDInFilter(field_name="court__club_id", lookup_expr="in", help_text="Club ids.")
+    court = UUIDInFilter(field_name="court_id", lookup_expr="in", help_text="Court ids.")
+    player = CharInFilter(method="filter_player", help_text="Player ids or emails (mixed); booker or guest.")
     role = filters.ChoiceFilter(
-        choices=[("owner", "owner"), ("guest", "guest")], method="filter_role"
+        choices=[("owner", "owner"), ("guest", "guest")], method="filter_role",
+        help_text="What you are in the booking: the booker (owner) or a guest.",
     )
 
     ordering = filters.OrderingFilter(
@@ -61,17 +65,19 @@ class ReservationFilter(filters.FilterSet):
         fields = []
         form = ReservationFilterForm
 
-    def filter_player(self, queryset, name, emails):
-        """Reservations in which any of the given players takes part (booker or guest)."""
-        emails = [e.strip() for e in emails if e.strip()]
-        if not emails:
+    def filter_player(self, queryset, name, entries):
+        """
+        Reservations in which any of the given players takes part (booker or
+        guest), each given by player id or email. Entries that are neither
+        match nothing, like an unknown email.
+        """
+        if not any(entry.strip() for entry in entries):
             return queryset
-        as_booker = reduce(or_, (Q(primary_player__email__iexact=e) for e in emails))
-        as_guest = Reservation.guests.through.objects.filter(
-            reduce(or_, (Q(user__email__iexact=e) for e in emails)),
-            reservation=OuterRef("pk"),
-        )
-        return queryset.filter(as_booker | Q(Exists(as_guest)))
+        references = parse_player_references(entries)
+        if not references:
+            return queryset.none()
+        as_guest = Reservation.guests.through.objects.filter(references.q("user"), reservation=OuterRef("pk"))
+        return queryset.filter(references.q("primary_player") | Q(Exists(as_guest)))
 
     def filter_role(self, queryset, name, role):
         user = self.request.user

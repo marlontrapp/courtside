@@ -3,7 +3,7 @@
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
-from apps.common.seed import CLUBS, MANAGER_EMAIL, PLAYERS, SEED_PASSWORD, seed
+from apps.common.seed import CLUBS, MANAGER_EMAIL, PLAYERS, RULES, SEED_PASSWORD, seed
 
 
 class Command(BaseCommand):
@@ -36,7 +36,8 @@ class Command(BaseCommand):
 
         created = (
             f"{result.users_created} users, {result.clubs_created} clubs, "
-            f"{result.courts_created} courts, {result.memberships_created} memberships"
+            f"{result.courts_created} courts, {result.memberships_created} memberships, "
+            f"{result.rules_created} booking rules"
         )
         self.stdout.write(self.style.SUCCESS(
             f"Seed data ready{' (reset)' if reset else ''}: created {created}; "
@@ -62,4 +63,8 @@ class Command(BaseCommand):
                 flags.append("INACTIVE")
             count = len(club.courts)
             w(f"    {club.name:<28} {count} court{'' if count == 1 else 's'}  ({', '.join(flags)})")
+        w("\n  Booking rules")
+        for rule in RULES:
+            club = next(c.name for c in CLUBS if c.key == rule.club)
+            w(f"    {club:<28} {rule.name}")
         w("")

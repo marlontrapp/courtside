@@ -225,3 +225,6 @@ __marimo__/
 
 # Local aligner dumps
 aligner/
+
+# Uploaded files in development (MEDIA_ROOT)
+media/
