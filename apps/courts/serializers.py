@@ -1,14 +1,18 @@
 """DRF serializers for the courts API."""
 
 import zoneinfo
+from decimal import Decimal
 
 from django.utils import timezone
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema_field, inline_serializer
 from rest_framework import serializers
 
 from apps.bookings.availability import MAX_WINDOW_DAYS, AvailabilityWindow
 
 from .models import Club, Court, CourtSchedule, DayTemplate, ScheduleOverride, Weekday
 from .schedule import END_OF_DAY, club_today, validate_day_slots
+from .search import RESULT_FIELDS
 from .services import template_locked
 
 
@@ -43,11 +47,15 @@ class AvailabilityQuerySerializer(serializers.Serializer):
     "Today" and "past" use the project timezone (settings.TIME_ZONE).
     """
 
-    date = serializers.DateField(required=False)
-    date_from = serializers.DateField(required=False)
-    date_to = serializers.DateField(required=False)
-    time_from = serializers.TimeField(required=False)
-    time_to = EndOfDayTimeField(required=False)
+    date = serializers.DateField(required=False, help_text="A single day (not with date_from/date_to).")
+    date_from = serializers.DateField(
+        required=False, help_text=f"First day of an inclusive range, with date_to (at most {MAX_WINDOW_DAYS} days)."
+    )
+    date_to = serializers.DateField(required=False, help_text="Last day of the range (inclusive).")
+    time_from = serializers.TimeField(
+        required=False, help_text="Only slots fully inside time_from–time_to (HH:MM, club time), each day."
+    )
+    time_to = EndOfDayTimeField(required=False, help_text='End of the time window (HH:MM; "24:00" = midnight).')
 
     def validate(self, attrs):
         single = attrs.get("date")
@@ -95,6 +103,42 @@ class AvailabilityQuerySerializer(serializers.Serializer):
         }
 
 
+class CourtSerializer(serializers.ModelSerializer):
+    """
+    A court, for its club's admins (read and write). Editable: everything but
+    the club. `force` (write-only): deactivating a court with future bookings
+    cancels them (otherwise 409). Expects `context["club"]` and, when
+    editing, the instance.
+    """
+
+    force = serializers.BooleanField(
+        default=False, write_only=True,
+        help_text="Deactivating a court with future bookings: cancel them (otherwise 409).",
+    )
+
+    class Meta:
+        model = Court
+        fields = [
+            "id", "name", "surface_type", "is_indoor", "is_singles_only", "has_lighting",
+            "hourly_rate", "lighting_fee", "is_active", "force", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+        extra_kwargs = {
+            "hourly_rate": {"min_value": Decimal("0")},
+            "lighting_fee": {"min_value": Decimal("0")},
+        }
+        validators = []  # the club isn't a field: name uniqueness is checked in validate_name
+
+    def validate_name(self, name: str) -> str:
+        name = name.strip()
+        taken = Court.objects.filter(club=self.context["club"], name=name)
+        if self.instance is not None:
+            taken = taken.exclude(pk=self.instance.pk)
+        if taken.exists():
+            raise serializers.ValidationError("This club already has a court with this name.")
+        return name
+
+
 class ClubSummarySerializer(serializers.ModelSerializer):
     class Meta:
         model = Club
@@ -102,14 +146,20 @@ class ClubSummarySerializer(serializers.ModelSerializer):
 
 
 class TimeSlotSerializer(serializers.Serializer):
-    """Slot boundaries as ISO-8601 in the club's own timezone (offset included)."""
+    """
+    Slot boundaries as ISO-8601 in the club's own timezone (offset included),
+    and the ids of the booking rules that cover it (see the court's `booking_rules`).
+    """
 
     start = serializers.SerializerMethodField()
     end = serializers.SerializerMethodField()
+    rules = serializers.ListField(child=serializers.UUIDField(), read_only=True)
 
+    @extend_schema_field(OpenApiTypes.DATETIME)
     def get_start(self, slot) -> str:
         return slot.start.isoformat()
 
+    @extend_schema_field(OpenApiTypes.DATETIME)
     def get_end(self, slot) -> str:
         return slot.end.isoformat()
 
@@ -122,15 +172,25 @@ class NoticeSerializer(serializers.Serializer):
     notes = serializers.CharField()
 
 
+class BookingRuleInfoSerializer(serializers.Serializer):
+    """A booking rule as players see it: {"id", "name", "kind", "summary"}."""
+
+    id = serializers.UUIDField()
+    name = serializers.CharField()
+    kind = serializers.CharField()
+    summary = serializers.CharField()
+
+
 class CourtAvailabilitySerializer(serializers.ModelSerializer):
     """
-    Court + its available slots and notices. Expects `context["availability"]`:
-    a mapping of court id -> CourtSlots.
+    Court + its available slots, notices and the booking rules its slots refer
+    to. Expects `context["availability"]`: a mapping of court id -> CourtSlots.
     """
 
     club = ClubSummarySerializer(read_only=True)
     available_slots = serializers.SerializerMethodField()
     notices = serializers.SerializerMethodField()
+    booking_rules = serializers.SerializerMethodField()
 
     class Meta:
         model = Court
@@ -139,19 +199,27 @@ class CourtAvailabilitySerializer(serializers.ModelSerializer):
             "name",
             "surface_type",
             "is_indoor",
+            "is_singles_only",
             "has_lighting",
             "hourly_rate",
             "lighting_fee",
             "club",
             "available_slots",
             "notices",
+            "booking_rules",
         ]
 
+    @extend_schema_field(TimeSlotSerializer(many=True))
     def get_available_slots(self, court) -> list[dict]:
         return TimeSlotSerializer(self.context["availability"][court.id].available, many=True).data
 
+    @extend_schema_field(NoticeSerializer(many=True))
     def get_notices(self, court) -> list[dict]:
         return NoticeSerializer(self.context["availability"][court.id].notices, many=True).data
+
+    @extend_schema_field(BookingRuleInfoSerializer(many=True))
+    def get_booking_rules(self, court) -> list[dict]:
+        return BookingRuleInfoSerializer(self.context["availability"][court.id].rules, many=True).data
 
 
 class ClubRegistrationSerializer(serializers.Serializer):
@@ -179,9 +247,44 @@ class ClubSerializer(serializers.ModelSerializer):
             "access_type",
             "cancellation_window_hours",
             "is_active",
+            "approval_status",
+            "rejection_reason",
             "created_at",
             "updated_at",
         ]
+        read_only_fields = fields
+
+
+class ClubReviewSerializer(ClubSerializer):
+    """A club as site staff review it: plus who registered it (a player summary — no email) and when it was reviewed."""
+
+    registered_by = serializers.SerializerMethodField()
+
+    class Meta(ClubSerializer.Meta):
+        fields = [*ClubSerializer.Meta.fields, "registered_by", "reviewed_at"]
+        read_only_fields = fields
+
+    @extend_schema_field(inline_serializer("ClubRegistrant", allow_null=True, fields={
+        "id": serializers.UUIDField(), "first_name": serializers.CharField(), "last_name": serializers.CharField(),
+    }))
+    def get_registered_by(self, club) -> dict | None:
+        from apps.users.serializers import PlayerSummarySerializer  # users depends on courts
+
+        return PlayerSummarySerializer(club.registered_by).data if club.registered_by else None
+
+
+class ClubRejectSerializer(serializers.Serializer):
+    reason = serializers.CharField(max_length=500, help_text="Sent to whoever registered the club.")
+
+
+class ClubSearchResultSerializer(serializers.ModelSerializer):
+    """A club in search results (GET /api/v1/clubs/search/)."""
+
+    class Meta:
+        model = Club
+        # The search loads only these columns (.only()); reading any other
+        # field here would cost one extra query per result.
+        fields = list(RESULT_FIELDS)
         read_only_fields = fields
 
 
@@ -222,6 +325,7 @@ class ClubUpdateSerializer(serializers.ModelSerializer):
 # --- Schedules ------------------------------------------------------------------------
 
 
+@extend_schema_field({"type": "string", "enum": list(Weekday.names)})
 class WeekdayField(serializers.Field):
     """Weekday by name ("MONDAY" … "SUNDAY", case-insensitive) <-> 0 … 6."""
 
@@ -240,6 +344,7 @@ class WeekdayField(serializers.Field):
 
 
 class SlotSerializer(serializers.Serializer):
+    id = serializers.UUIDField(read_only=True, help_text="The slot's id (e.g. to link a booking rule to it).")
     start = serializers.TimeField(format="%H:%M")
     end = EndOfDayTimeField(format="%H:%M", help_text='Use "24:00" for a slot ending at midnight.')
 
@@ -266,9 +371,10 @@ class DayTemplateSerializer(serializers.ModelSerializer):
         model = DayTemplate
         fields = ["id", "name", "slots", "locked", "created_at", "updated_at"]
 
+    @extend_schema_field(SlotSerializer(many=True))
     def get_slots(self, template) -> list[dict]:
         return SlotSerializer(
-            [{"start": s.start_time, "end": s.end_time} for s in template.slots.all()], many=True
+            [{"id": s.pk, "start": s.start_time, "end": s.end_time} for s in template.slots.all()], many=True
         ).data
 
     def get_locked(self, template) -> bool:
@@ -349,6 +455,10 @@ class CourtScheduleSerializer(serializers.ModelSerializer):
             return "past"
         return "current" if version.valid_from <= today else "planned"
 
+    @extend_schema_field(inline_serializer("ScheduleDays", many=True, fields={
+        "weekdays": serializers.ListField(child=WeekdayField()),
+        "day_template": TemplateRefSerializer(allow_null=True, help_text="null = closed those days."),
+    }))
     def get_days(self, version) -> list[dict]:
         by_weekday = {d.weekday: d.day_template for d in version.days.all()}
         groups: dict = {}
@@ -384,11 +494,13 @@ class ScheduleOverrideSerializer(serializers.ModelSerializer):
         model = ScheduleOverride
         fields = ["date", "type", "notes", "day_template", "slots", "created_at", "updated_at"]
 
+    @extend_schema_field(SlotSerializer(many=True))
     def get_slots(self, override) -> list[dict]:
         if override.day_template is None:
             return []
         return SlotSerializer(
-            [{"start": s.start_time, "end": s.end_time} for s in override.day_template.slots.all()], many=True
+            [{"id": s.pk, "start": s.start_time, "end": s.end_time} for s in override.day_template.slots.all()],
+            many=True,
         ).data
 
 

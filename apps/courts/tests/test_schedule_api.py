@@ -40,6 +40,11 @@ def slot_list(*pairs: str) -> list[dict]:
     return [{"start": p.split("-")[0], "end": p.split("-")[1]} for p in pairs]
 
 
+def times(slots: list[dict]) -> list[dict]:
+    """Slots as returned (each also has an "id"), without the id."""
+    return [{"start": slot["start"], "end": slot["end"]} for slot in slots]
+
+
 class ScheduleAPITestCase(FrozenTimeMixin, APITestCase):
     frozen_now = datetime(2030, 1, 7, 12, 0, tzinfo=SP)
 
@@ -97,19 +102,20 @@ class DayTemplateAPITests(ScheduleAPITestCase):
         created = self.create_template("Workdays", "07:00-08:00", "08:00-09:00")
 
         self.assertEqual(created["name"], "Workdays")
-        self.assertEqual(created["slots"], slot_list("07:00-08:00", "08:00-09:00"))
+        self.assertEqual(times(created["slots"]), slot_list("07:00-08:00", "08:00-09:00"))
+        self.assertTrue(all(slot["id"] for slot in created["slots"]))
         self.assertFalse(created["locked"])
         self.assertEqual([t["name"] for t in self.client.get(self.templates_url()).json()], ["Workdays"])
 
     def test_slots_are_returned_in_order(self):
         created = self.create_template("Mixed", "10:00-11:00", "07:00-08:00")
 
-        self.assertEqual(created["slots"], slot_list("07:00-08:00", "10:00-11:00"))
+        self.assertEqual(times(created["slots"]), slot_list("07:00-08:00", "10:00-11:00"))
 
     def test_24_00_ends_a_slot_at_midnight(self):
         created = self.create_template("Late", "22:00-23:00", "23:00-24:00")
 
-        self.assertEqual(created["slots"][-1], {"start": "23:00", "end": "24:00"})
+        self.assertEqual(times(created["slots"])[-1], {"start": "23:00", "end": "24:00"})
         self.assertEqual(DayTemplate.objects.get().slots.last().end_time.isoformat(), "23:59:59.999999")
 
     def test_invalid_templates(self):
@@ -234,7 +240,7 @@ class CourtScheduleAPITests(ScheduleAPITestCase):
     def test_conflict_then_force(self):
         self.workdays_and_weekend()
         booking = create_reservation(
-            court=self.court, primary_player=create_user(email="ana@example.com"),
+            court=self.court, primary_player=create_user(email="ana@example.com", first_name="Ana", last_name="Souza"),
             start_datetime=datetime(2030, 1, 8, 18, tzinfo=SP), end_datetime=datetime(2030, 1, 8, 19, tzinfo=SP),
         )
         evening = self.create_template("Evening", "18:30-20:00")
@@ -246,8 +252,10 @@ class CourtScheduleAPITests(ScheduleAPITestCase):
         self.assertEqual(conflict.json()["conflicting_reservations"], [{
             "id": str(booking.pk), "court": str(self.court.pk), "court_name": "Court 1",
             "start": "2030-01-08T18:00:00-03:00", "end": "2030-01-08T19:00:00-03:00",
-            "primary_player": "ana@example.com", "status": "CONFIRMED",
+            "primary_player": {"id": str(booking.primary_player_id), "first_name": "Ana", "last_name": "Souza"},
+            "status": "CONFIRMED",
         }])
+        self.assertNotIn("ana@example.com", conflict.content.decode())  # club admins don't see emails either
         self.assertIn("force", conflict.json()["hint"])
         self.assertEqual(CourtSchedule.objects.count(), 1)
 
@@ -255,6 +263,8 @@ class CourtScheduleAPITests(ScheduleAPITestCase):
 
         self.assertEqual(forced.status_code, status.HTTP_201_CREATED, forced.data)
         self.assertEqual([r["id"] for r in forced.json()["cancelled_reservations"]], [str(booking.pk)])
+        self.assertEqual(forced.json()["cancelled_reservations"][0]["primary_player"]["first_name"], "Ana")
+        self.assertNotIn("ana@example.com", forced.content.decode())
         booking.refresh_from_db()
         self.assertEqual(booking.status, Reservation.Status.CANCELLED)
 
@@ -334,7 +344,7 @@ class ScheduleOverrideAPITests(ScheduleAPITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertEqual(response.json()["date"], d(2))
         self.assertEqual(response.json()["day_template"]["name"], "Weekend")
-        self.assertEqual(response.json()["slots"], slot_list("08:00-09:30", "09:30-11:00"))
+        self.assertEqual(times(response.json()["slots"]), slot_list("08:00-09:30", "09:30-11:00"))
         self.assertEqual(self.available(d(2)), ["08:00-09:30", "09:30-11:00"])
         override = self.client.get(self.override_url(d(2))).json()
         self.assertEqual((override["type"], override["notes"]), ("TOURNAMENT", "Junior club championship"))

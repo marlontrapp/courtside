@@ -1,0 +1,4937 @@
+openapi: 3.0.3
+info:
+  title: CourtControl API
+  version: 1.0.0
+  description: |
+    Tennis court booking and scheduling. Every endpoint lives under `/api/v1/`
+    and needs a logged-in user (any user, not only staff) — except the account
+    endpoints (sign up, log in, password reset).
+
+    ## Accounts and authentication (session)
+
+    Accounts (tag *Accounts*, `/api/v1/auth/…`):
+
+    - **Sign up** with an email, a name and — optionally — a password: a 6-digit
+      code is emailed, and verifying it creates the account and logs in.
+    - **Log in** with the password, or with a **code sent by email** (accounts
+      without a password always do).
+    - **Forgot password:** a code sent by email lets you set a new password (or a
+      first one); every other session is logged out.
+
+    Codes expire after 10 minutes, allow 5 tries and work once; each request
+    returns a `challenge_id` to send back with the code. Answers never reveal
+    whether an email has an account.
+
+    Logging in starts a **session** (cookie) that authenticates every request.
+    `POST`, `PUT`, `PATCH` and `DELETE` — including the account endpoints,
+    before logging in — need the CSRF token in the `X-CSRFToken` header (from
+    `GET /api/v1/auth/csrf/` or the `csrftoken` cookie) and, over HTTPS, a
+    same-origin `Referer`. Not logged in → `403`. In a browser, DRF's browsable
+    API also has a **Log in** link (`/api-auth/login/`).
+
+    With curl, keep the session in a cookie jar:
+
+    ```bash
+    BASE=http://localhost:8000
+    csrf() { awk '$6 == "csrftoken" {print $7}' cookies.txt; }
+    curl -s -c cookies.txt "$BASE/api/v1/auth/csrf/" -o /dev/null        # the csrftoken cookie
+    curl -s -b cookies.txt -c cookies.txt -X POST "$BASE/api/v1/auth/login/" \
+      -H "Content-Type: application/json" -H "X-CSRFToken: $(csrf)" -H "Referer: $BASE/" \
+      -d '{"email": "player@example.com", "password": "<password>"}'     # the account; a session
+
+    curl -s -b cookies.txt -G "$BASE/api/v1/courts/" --data-urlencode "date=2030-01-08"
+
+    curl -s -b cookies.txt -X POST "$BASE/api/v1/reservations/" \
+      -H "Content-Type: application/json" -H "X-CSRFToken: $(csrf)" -H "Referer: $BASE/" \
+      -d '{"court": "<court id>", "date": "2030-01-08", "start_time": "18:00", "end_time": "19:00"}'
+    ```
+
+    (The CSRF token changes when you log in: read it from the cookie again, as
+    `csrf()` does.)
+
+    ## Conventions
+
+    - **Players** appear as `{"id": "<user id>", "first_name": "…", "last_name":
+      "…"}`. **No endpoint returns a player's email** — except your own, in your
+      account (`GET /api/v1/me/` and the login responses). Input that refers to
+      players — booking `guests`, the reservations' `player` filter — takes the
+      player **id** (as returned by the player search) or an email.
+    - **Times** are wall-clock in each **club's timezone**: dates and times you
+      send (`date`, `start_time`, …) and the ISO-8601 datetimes returned (with
+      the club's offset). A slot ending at midnight is written `"24:00"`.
+    - **Errors:** `400` with the invalid fields (`{"field": ["message"]}`, or
+      `non_field_errors`), `403` not logged in / not allowed, `404` unknown — or
+      not yours to see (a members-only court you can't book, a club you don't
+      administer), `409` a conflict (the message says why).
+    - **Pagination:** lists are paginated by `?page=` (25 per page):
+      `{"count", "next", "previous", "results"}`. The searches skip the total
+      count: `{"next", "previous", "results"}`.
+
+    ## Clubs: self-service registration with approval
+
+    Any logged-in user can **register a club** (`POST /api/v1/clubs/`). It starts
+    **awaiting approval** (`approval_status: PENDING`): hidden from players —
+    search, courts listing, booking — and visible only to its club admins and
+    site staff. Whoever registers it becomes its **club admin**, so they can set
+    it up meanwhile — settings, **courts** (`/api/v1/clubs/<club>/courts/`), day
+    templates, schedules, booking rules — and it goes live once approved. Site
+    staff review the queue (`GET /api/v1/clubs/pending/`) and **approve** or
+    **reject** (with a reason) — the registrant is emailed the decision. At most
+    3 clubs awaiting approval per user. Clubs registered by site staff are
+    approved right away.
+
+    ## Schedules
+
+    A court's bookable slots come from three pieces, managed by club admins:
+
+    - **Day templates** ("slot configurations") — a club's named slot lists,
+      e.g. *Workdays* or *Weekend*: slots of any length, gaps allowed, never
+      overlapping.
+    - **Weekly schedule versions** — which template each weekday of a court uses,
+      valid from `valid_from` until `valid_until` (empty = no end). A court's
+      versions never overlap: together they're the history and plan of its
+      schedule.
+    - **One-time overrides** — a court + a date → another template, or closed,
+      with a `type` (`MAINTENANCE`, `WEATHER`, `TOURNAMENT`, `EVENT`, `HOLIDAY`,
+      `OTHER`) and `notes` members see (courts listing `notices`, booking
+      errors): *"Junior club championship until 14:00"* is an override whose
+      template only has the afternoon slots; *"Flooded"* is a closed one.
+
+    Slots of a court on a date = the override for that date if any, else the
+    version covering the date → the template of that weekday (no template =
+    closed). Availability and booking validation both use this.
+
+    **History** (per club-local day): anything that applied to a day *before
+    today* never changes — versions can only start today or later (the one in
+    effect is cut short; with `valid_until`, the interrupted one resumes
+    afterwards), past versions and overrides can't be deleted, and a template's
+    slots freeze once it has applied to a past day (schedule a new template
+    instead). Today is still editable.
+
+    **Future bookings:** a change that would leave a future booking (one that
+    fitted the old slots) no longer fitting is refused with `409` listing those
+    bookings — pick a later date, or resend with `"force": true` (`?force=true`
+    on `DELETE`) to **cancel** them; the response lists `cancelled_reservations`.
+    Started or past bookings are never touched.
+
+    Only **club admins** (a current club-admin role at the club) and site staff
+    can use the schedule endpoints; for anyone else the club or court doesn't
+    exist (`404`).
+
+    ## Booking rules
+
+    A club can make its slots — or the whole club — bookable only when a booking
+    meets a rule: doubles only, women only, an age range, at most N bookings per
+    week in prime time, one upcoming booking per player, …
+
+    - **Where** — a rule belongs to a club and is linked to any of: `courts`,
+      `day_templates` (slot configurations: the days a court uses one of them)
+      and `slots` (single slots of a day template: bookings covering one of
+      them). Nothing linked = **the whole club**. Each kind of link narrows the
+      rule (court **and** template **and** slot), any of the linked ones within a
+      kind: courts 1–2 + the 19:00 slot = that slot on those two courts only.
+      `valid_from` / `valid_until` (optional) limit when it's in force.
+    - **What** — a `kind` and its `params`; `GET /api/v1/booking-rule-kinds/`
+      describes them: `booking_types` (e.g. doubles only), `player_gender`
+      (women only), `player_age` (age on the match day), `max_bookings_per_period`
+      (per day / week Mon–Sun / month) and `max_active_bookings` (upcoming at a
+      time).
+    - **Players** — gender and age rules check the booker and, with
+      `applies_to: all_players` (default), every **named** guest; missing
+      profile data means not eligible. Count limits apply to the booker **and to
+      every guest who is a member of the club**: the booking counts towards each
+      of their limits, and a member's bookings count whether they booked or were
+      a guest. `counts`: `matching` (default — only bookings the rule covers,
+      e.g. only prime-time ones) or `club` (every booking at the club); bookings
+      not cancelled or expired count.
+    - **Enforcement** — checked when booking: every broken rule is reported in a
+      `400`. Messages never reveal a guest's personal data ("at least one of your
+      guests doesn't meet it"). Rules apply to new bookings only: changing or
+      deleting a rule never affects existing bookings.
+    - **Visible** in the courts listing: each slot's `rules` (ids) and each
+      court's `booking_rules` (`name`, `summary`).
+    - **Deleting** a court, day template or slot linked to a rule is refused
+      (`409` listing the rules) unless forced (`force=true`): the links are
+      removed, and a rule left without any link of a kind it had (e.g. its only
+      court) is **deactivated** rather than silently covering more — the
+      response lists `unlinked_booking_rules` and `deactivated_booking_rules`.
+
+    A **singles court** isn't a rule but a property of the court
+    (`is_singles_only`): no doubles, at most 2 players (the booker and 1 guest).
+paths:
+  /api/v1/auth/csrf/:
+    get:
+      operationId: auth_csrf_retrieve
+      description: 'Sets the `csrftoken` cookie and returns the token: send it in
+        the `X-CSRFToken` header of every `POST`/`PUT`/`PATCH`/`DELETE` — the account
+        endpoints check it even before you log in.'
+      summary: Get a CSRF token
+      tags:
+      - Accounts
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CsrfToken'
+          description: ''
+  /api/v1/auth/login/:
+    post:
+      operationId: auth_login_create
+      description: 'Email (any case) and password. Starts a session (cookie) and returns
+        the account; the CSRF token changes (read the new cookie). Accounts without
+        a password: log in with a code.'
+      summary: Log in with a password
+      tags:
+      - Accounts
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordLoginRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PasswordLoginRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PasswordLoginRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: Invalid email or password (not saying which).
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: No valid CSRF token (see *Get a CSRF token*).
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: 'Too many requests: too many codes for this email (`Retry-After`
+            header: seconds to wait), or too many requests from this client.'
+  /api/v1/auth/login/code/:
+    post:
+      operationId: auth_login_code_create
+      description: 'Emails a code to log in without a password (*Log in with a code*).
+        The answer is the same whether the email has an account or not. The code has
+        6 digits, expires after 10 minutes (`expires_at`), allows 5 tries and works
+        once; requesting a new one cancels the previous. Codes per email: one a minute
+        for each purpose (sign-up, login, password reset), five an hour in all (`429`).'
+      summary: Request a login code
+      tags:
+      - Accounts
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmailRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/EmailRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/EmailRequest'
+        required: true
+      responses:
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Challenge'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: 'Invalid input: `{"<field>": ["message", …]}` (or `non_field_errors`).'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: No valid CSRF token (see *Get a CSRF token*).
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: 'Too many requests: too many codes for this email (`Retry-After`
+            header: seconds to wait), or too many requests from this client.'
+  /api/v1/auth/login/code/verify/:
+    post:
+      operationId: auth_login_code_verify_create
+      description: The `challenge_id` from *Request a login code* and the emailed
+        code. Starts a session (cookie) and returns the account; the CSRF token changes
+        (read the new cookie).
+      summary: Log in with a code
+      tags:
+      - Accounts
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CodeRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/CodeRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/CodeRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodeError'
+          description: 'Wrong, expired or already used code, or too many wrong tries
+            (5): request a new one.'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: No valid CSRF token (see *Get a CSRF token*).
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: 'Too many requests: too many codes for this email (`Retry-After`
+            header: seconds to wait), or too many requests from this client.'
+  /api/v1/auth/logout/:
+    post:
+      operationId: auth_logout_create
+      description: Ends the session. `204` also when not logged in.
+      summary: Log out
+      tags:
+      - Accounts
+      security:
+      - cookieAuth: []
+      - {}
+      responses:
+        '204':
+          description: Logged out.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: No valid CSRF token (see *Get a CSRF token*).
+  /api/v1/auth/password/reset/:
+    post:
+      operationId: auth_password_reset_create
+      description: 'Emails a code to set a new password (*Set a new password*) — also
+        for an account that has none yet. The answer is the same whether the email
+        has an account or not. The code has 6 digits, expires after 10 minutes (`expires_at`),
+        allows 5 tries and works once; requesting a new one cancels the previous.
+        Codes per email: one a minute for each purpose (sign-up, login, password reset),
+        five an hour in all (`429`).'
+      summary: 'Forgot password: request a code'
+      tags:
+      - Accounts
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmailRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/EmailRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/EmailRequest'
+        required: true
+      responses:
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Challenge'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: 'Invalid input: `{"<field>": ["message", …]}` (or `non_field_errors`).'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: No valid CSRF token (see *Get a CSRF token*).
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: 'Too many requests: too many codes for this email (`Retry-After`
+            header: seconds to wait), or too many requests from this client.'
+  /api/v1/auth/password/reset/confirm/:
+    post:
+      operationId: auth_password_reset_confirm_create
+      description: The `challenge_id` from *Forgot password*, the emailed code and
+        the new password (password rules apply; a rejected password doesn't use up
+        the code). **Every other session of the account is logged out.** Starts a
+        session (cookie) and returns the account; the CSRF token changes (read the
+        new cookie).
+      summary: Set a new password
+      tags:
+      - Accounts
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordResetConfirmRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PasswordResetConfirmRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PasswordResetConfirmRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: Bad code (`code`), or the password breaks the rules (`new_password`).
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: No valid CSRF token (see *Get a CSRF token*).
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: 'Too many requests: too many codes for this email (`Retry-After`
+            header: seconds to wait), or too many requests from this client.'
+  /api/v1/auth/signup/:
+    post:
+      operationId: auth_signup_create
+      description: |2
+
+        Emails a code to finish signing up (*Verify sign-up*); the account is only
+        created then — with this request's name and password. The password is
+        optional: without one, log in with codes (and set one later through the
+        password reset). It must pass the password rules (length, not too common,
+        not all digits, not like your name or email).
+
+        The answer is the same whether the email is already registered (to not
+        reveal it): if it is, its owner gets a code that logs them in instead.
+        The code has 6 digits, expires after 10 minutes (`expires_at`), allows 5 tries and works once; requesting a new one cancels the previous. Codes per email: one a minute for each purpose (sign-up, login, password reset), five an hour in all (`429`).
+      summary: Sign up
+      tags:
+      - Accounts
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignupRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/SignupRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/SignupRequest'
+        required: true
+      responses:
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Challenge'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: 'Invalid input: `{"<field>": ["message", …]}` (or `non_field_errors`).'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: No valid CSRF token (see *Get a CSRF token*).
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: 'Too many requests: too many codes for this email (`Retry-After`
+            header: seconds to wait), or too many requests from this client.'
+  /api/v1/auth/signup/verify/:
+    post:
+      operationId: auth_signup_verify_create
+      description: The `challenge_id` from *Sign up* and the emailed code. Creates
+        the account (`201`), or — the email was already registered — logs its owner
+        in (`200`). Starts a session (cookie) and returns the account; the CSRF token
+        changes (read the new cookie).
+      summary: Verify sign-up (and log in)
+      tags:
+      - Accounts
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CodeRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/CodeRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/CodeRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+          description: 'The email already had an account: logged in.'
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+          description: 'Account created: logged in.'
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodeError'
+          description: 'Wrong, expired or already used code, or too many wrong tries
+            (5): request a new one.'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: No valid CSRF token (see *Get a CSRF token*).
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: 'Too many requests: too many codes for this email (`Retry-After`
+            header: seconds to wait), or too many requests from this client.'
+  /api/v1/booking-rule-kinds/:
+    get:
+      operationId: booking_rule_kinds_list
+      description: Every rule kind and its `params` (type, required, default, choices,
+        limits, help) — for building rule editors. Any logged-in user.
+      summary: List booking rule kinds
+      tags:
+      - Booking rules
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BookingRuleKind'
+          description: ''
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+  /api/v1/clubs/:
+    post:
+      operationId: clubs_create
+      description: |2
+
+        Any logged-in user can register a club from just its **name** and **address**
+        (both required, non-blank). It starts **awaiting approval**
+        (`approval_status: PENDING`): hidden from players — search, courts, booking —
+        until site staff approve it (you're emailed the decision). You become its
+        **club admin**, so you can set it up meanwhile: edit its settings, day
+        templates, schedules and booking rules. At most 3 clubs awaiting approval per
+        user (`429`). Registered by site staff: approved right away.
+
+        Everything else starts at its default — timezone `America/Sao_Paulo`, access
+        `OPEN`, 24 h cancellation window, active — and is set later by editing the
+        club; other fields sent are ignored. Names needn't be unique, but slugs are:
+        the name (`tennis-club`); if taken, name + address
+        (`tennis-club-rua-augusta-100`); then name + address + a number (`…-2`, `-3`, …).
+      summary: Register a club
+      tags:
+      - Clubs
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClubRegistrationRequest'
+            examples:
+              Club:
+                value:
+                  name: Ibirapuera Tennis Center
+                  address: Av. Pedro Álvares Cabral, São Paulo
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/ClubRegistrationRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/ClubRegistrationRequest'
+        required: true
+      security:
+      - cookieAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Club'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: 'Invalid input: `{"<field>": ["message", …]}` (or `non_field_errors`).'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Too many of your clubs are awaiting approval.
+  /api/v1/clubs/{club_pk}/booking-rules/:
+    get:
+      operationId: booking_rules_list
+      description: Club admins and site staff only.
+      summary: List a club's booking rules
+      parameters:
+      - in: path
+        name: club_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Booking rules
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BookingRule'
+          description: ''
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+    post:
+      operationId: booking_rules_create
+      description: |2
+
+        Where: linked `courts`, `day_templates` (slot configurations) and `slots`
+        (single slots — ids in the day template endpoints) of this club; nothing
+        linked = the whole club; each kind of link narrows it (court **and**
+        template **and** slot). When: `valid_from` / `valid_until` (optional). What:
+        `kind` + `params` (see *List booking rule kinds*). Rules apply to bookings
+        made after they're saved — never to existing ones.
+      summary: Add a booking rule
+      parameters:
+      - in: path
+        name: club_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Booking rules
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BookingRuleRequest'
+            examples:
+              Women'sEvening:
+                value:
+                  name: Women's evening
+                  kind: player_gender
+                  params:
+                    allowed:
+                    - FEMALE
+                  courts:
+                  - <court 1 id>
+                  - <court 2 id>
+                  slots:
+                  - <19:00 slot id>
+                  - <20:00 slot id>
+                summary: Women's evening
+              PrimeTime:2AWeek:
+                value:
+                  name: Prime time
+                  kind: max_bookings_per_period
+                  params:
+                    max: 2
+                    period: week
+                  slots:
+                  - <18:00 slot id>
+                  - <19:00 slot id>
+                summary: 'Prime time: 2 a week'
+              OneUpcomingBooking:
+                value:
+                  name: One at a time
+                  kind: max_active_bookings
+                  params:
+                    max: 1
+                summary: One upcoming booking
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/BookingRuleRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/BookingRuleRequest'
+        required: true
+      security:
+      - cookieAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingRule'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: 'Invalid input: `{"<field>": ["message", …]}` (or `non_field_errors`).'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+  /api/v1/clubs/{club_pk}/booking-rules/{id}/:
+    get:
+      operationId: booking_rules_retrieve
+      description: |-
+        GET    /api/v1/clubs/<club>/booking-rules/<id>/
+        PATCH  — any subset of the fields; changing `kind` needs `params` valid for it.
+                 Set "is_active": false to pause a rule.
+        DELETE — 204. Neither affects existing bookings.
+      summary: View a booking rule
+      parameters:
+      - in: path
+        name: club_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Booking rules
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingRule'
+          description: ''
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+    patch:
+      operationId: booking_rules_update
+      description: 'Any subset of the fields; a new `kind` needs `params` valid for
+        it. `"is_active": false` pauses a rule. Existing bookings are never affected.'
+      summary: Edit a booking rule
+      parameters:
+      - in: path
+        name: club_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Booking rules
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedBookingRuleRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedBookingRuleRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedBookingRuleRequest'
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingRule'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: 'Invalid input: `{"<field>": ["message", …]}` (or `non_field_errors`).'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+    delete:
+      operationId: booking_rules_destroy
+      description: Existing bookings are never affected.
+      summary: Delete a booking rule
+      parameters:
+      - in: path
+        name: club_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Booking rules
+      security:
+      - cookieAuth: []
+      responses:
+        '204':
+          description: Deleted.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+  /api/v1/clubs/{club_pk}/courts/:
+    get:
+      operationId: club_courts_list
+      description: Every court of the club, inactive ones too. Club admins and site
+        staff.
+      summary: List a club's courts (club admins)
+      parameters:
+      - in: path
+        name: club_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Courts
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Court'
+          description: ''
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+    post:
+      operationId: club_courts_create
+      description: |2
+
+        Adds a court to a club you administer — also while the club awaits approval,
+        so it's ready when approved. Names are unique within the club. To be
+        bookable, a court also needs a weekly schedule (*Add a weekly schedule
+        version*); `is_singles_only`: no doubles, at most 2 players.
+      summary: Add a court (club admins)
+      parameters:
+      - in: path
+        name: club_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Courts
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CourtRequest'
+            examples:
+              ClayCourt:
+                value:
+                  name: Court 1
+                  surface_type: CLAY
+                  has_lighting: true
+                  hourly_rate: '120.00'
+                  lighting_fee: '30.00'
+                summary: Clay court
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/CourtRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/CourtRequest'
+        required: true
+      security:
+      - cookieAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Court'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: 'Invalid input: `{"<field>": ["message", …]}` (or `non_field_errors`).'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+  /api/v1/clubs/{club_pk}/courts/{id}/:
+    get:
+      operationId: club_courts_retrieve
+      description: |-
+        GET    /api/v1/clubs/<club>/courts/<id>/
+        PATCH  — any subset of the settings; deactivating a court with future
+                 bookings: 409 listing them, or "force": true to cancel them.
+        DELETE — only courts without bookings (else 409: deactivate instead);
+                 linked to booking rules: 409, or ?force=true to unlink them.
+      summary: View a court (club admins)
+      parameters:
+      - in: path
+        name: club_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Courts
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Court'
+          description: ''
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+    patch:
+      operationId: club_courts_update
+      description: |2
+
+        Any subset of the settings. **Deactivating** (`"is_active": false`) a court
+        with future bookings is refused (`409` listing them) unless `"force": true`,
+        which cancels them. Other changes never affect existing bookings: their
+        price and lighting are kept, and a court becoming singles-only keeps its
+        doubles.
+      summary: Edit a court (club admins)
+      parameters:
+      - in: path
+        name: club_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Courts
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedCourtRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedCourtRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedCourtRequest'
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CourtChange'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: 'Invalid input: `{"<field>": ["message", …]}` (or `non_field_errors`).'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleConflict'
+          description: 'Future bookings wouldn''t fit anymore: they''re listed. Pick
+            a later date, or resend with force.'
+    delete:
+      operationId: club_courts_destroy
+      description: |2
+
+        Only a court **without bookings** — bookings are history: deactivate it
+        instead (`409`). Linked to booking rules: `409` listing them, or
+        `?force=true` to unlink them (a rule left without a court link is
+        deactivated). Without force: `204`; with force: `200` and the report.
+      summary: Delete a court (club admins)
+      parameters:
+      - in: path
+        name: club_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: query
+        name: force
+        schema:
+          type: boolean
+        description: 'Proceed anyway: cancel future bookings that no longer fit (reported
+          in `cancelled_reservations`), or unlink booking rules (reported).'
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Courts
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnlinkReport'
+          description: ''
+        '204':
+          description: Deleted.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LinkedToRules'
+          description: 'Has bookings (`detail` only: deactivate it instead), or linked
+            to booking rules.'
+  /api/v1/clubs/{club_pk}/day-templates/:
+    get:
+      operationId: day_templates_list
+      description: |-
+        GET  /api/v1/clubs/<club>/day-templates/ — the club's day templates.
+        POST /api/v1/clubs/<club>/day-templates/ — {"name": "Workdays", "slots":
+             [{"start": "06:00", "end": "07:00"}, ...]}; "24:00" ends a slot at midnight.
+      summary: List a club's day templates
+      parameters:
+      - in: path
+        name: club_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Schedules
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DayTemplate'
+          description: ''
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+    post:
+      operationId: day_templates_create
+      description: Named slot list (slot configuration), e.g. *Workdays*. Slots never
+        overlap; `"24:00"` ends one at midnight.
+      summary: Create a day template
+      parameters:
+      - in: path
+        name: club_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Schedules
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DayTemplateWriteRequest'
+            examples:
+              Workdays:
+                value:
+                  name: Workdays
+                  slots:
+                  - start: 07:00
+                    end: 08:00
+                  - start: '18:00'
+                    end: '24:00'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/DayTemplateWriteRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/DayTemplateWriteRequest'
+        required: true
+      security:
+      - cookieAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DayTemplate'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: 'Invalid input: `{"<field>": ["message", …]}` (or `non_field_errors`).'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+  /api/v1/clubs/{club_pk}/day-templates/{id}/:
+    get:
+      operationId: day_templates_retrieve
+      description: Each slot has an `id` — e.g. to link a booking rule to it.
+      summary: View a day template
+      parameters:
+      - in: path
+        name: club_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Schedules
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DayTemplate'
+          description: ''
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+    patch:
+      operationId: day_templates_update
+      description: |2
+
+        Rename anytime. `slots` can change until the template is `locked` (it has
+        applied to a past day: `409`); unchanged slots keep their `id`. Future
+        bookings no longer fitting: `409`, or cancelled with `"force": true`.
+        Removing a slot linked to a booking rule: `409`, or `"force": true` — the
+        links are removed and rules left without a slot link are deactivated.
+      summary: Rename a day template or change its slots
+      parameters:
+      - in: path
+        name: club_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Schedules
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedDayTemplateWriteRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedDayTemplateWriteRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedDayTemplateWriteRequest'
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DayTemplateChange'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: 'Invalid input: `{"<field>": ["message", …]}` (or `non_field_errors`).'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+        '409':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: Locked, bookings in the way (`conflicting_reservations`), or
+            slots linked to booking rules (`booking_rules`).
+    delete:
+      operationId: day_templates_destroy
+      description: |2
+
+        Only when no schedule or override uses it (`409`). Linked to booking rules
+        (itself or its slots): `409` listing them, or `?force=true` to unlink them —
+        a rule left without any link of that kind is deactivated rather than
+        covering more. Without force: `204`; with force: `200` and the report.
+      summary: Delete a day template
+      parameters:
+      - in: path
+        name: club_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: query
+        name: force
+        schema:
+          type: boolean
+        description: 'Proceed anyway: cancel future bookings that no longer fit (reported
+          in `cancelled_reservations`), or unlink booking rules (reported).'
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Schedules
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnlinkReport'
+          description: ''
+        '204':
+          description: Deleted.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LinkedToRules'
+          description: Used by a schedule or override (`detail` only), or linked to
+            booking rules.
+  /api/v1/clubs/{id}/:
+    get:
+      operationId: clubs_retrieve
+      description: 'Any logged-in user may fetch an approved club. A club awaiting
+        approval (or rejected — see `rejection_reason`) only its club admins and site
+        staff: for others it doesn''t exist (`404`).'
+      summary: View a club
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Clubs
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Club'
+          description: ''
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found.
+    patch:
+      operationId: clubs_partial_update
+      description: |2
+
+        **The club's admins and site staff.** Every setting can be changed **except `name` and
+        `address`** — that's a support request, rejected with a `400` pointing at
+        support. Send any subset of the editable fields. Changing `timezone` only
+        affects how *new* wall-clock times are interpreted (existing bookings keep
+        their instant, so their local time shifts); switching to `MEMBERS_ONLY`
+        doesn't affect existing bookings either.
+      summary: Edit a club (its admins, site staff)
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Clubs
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedClubUpdateRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedClubUpdateRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedClubUpdateRequest'
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Club'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: 'Invalid input: `{"<field>": ["message", …]}` (or `non_field_errors`).'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in, or not staff nor a club admin.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found.
+  /api/v1/clubs/{id}/approve/:
+    post:
+      operationId: clubs_approve_create
+      description: Makes a club awaiting approval (or rejected) live; whoever registered
+        it is emailed.
+      summary: Approve a club (site staff)
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Clubs
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClubReview'
+          description: ''
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in, or not site staff.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Already approved.
+  /api/v1/clubs/{id}/reject/:
+    post:
+      operationId: clubs_reject_create
+      description: 'Rejects a club awaiting approval: it stays hidden, and whoever
+        registered it is emailed the `reason`. It can still be approved later. (To
+        hide an approved club, deactivate it.)'
+      summary: Reject a club (site staff)
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Clubs
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClubRejectRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/ClubRejectRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/ClubRejectRequest'
+        required: true
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClubReview'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: 'Invalid input: `{"<field>": ["message", …]}` (or `non_field_errors`).'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in, or not site staff.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not awaiting approval.
+  /api/v1/clubs/pending/:
+    get:
+      operationId: clubs_pending_list
+      description: Self-registered clubs awaiting approval, oldest first, with who
+        registered them.
+      summary: Clubs awaiting approval (site staff)
+      parameters:
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      tags:
+      - Clubs
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedClubReviewList'
+          description: ''
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in, or not site staff.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: ''
+  /api/v1/clubs/search/:
+    get:
+      operationId: clubs_search_list
+      description: |2
+
+        **Active** clubs — open and members-only (`access_type` tells them apart) —
+        whose **name or address** contains every word of `q`. The address is free
+        text, so anything in it is searchable: street, number, neighbourhood, city,
+        state, country. Names and addresses are returned exactly as entered
+        (accents included).
+
+        Best matches first: the name starts with the query, then the name contains it, then the name contains every word, then the rest; ties by name. Paginated **without a total count** (counting every match can cost as much as the search itself); a page past the end is empty.
+      summary: Find clubs by name and address
+      parameters:
+      - name: page
+        required: false
+        in: query
+        description: Page number (25 per page); a page past the end is empty.
+        schema:
+          type: integer
+          minimum: 1
+      - in: query
+        name: q
+        schema:
+          type: string
+        description: 'Words to find in the club''s name or address: every word must
+          appear, whole or partial, ignoring case and accents. Words are runs of letters/digits
+          (punctuation separates them); 1-character words are ignored; at least one
+          word needs 3+ characters (shorter ones still filter); at most 8 words and
+          100 characters. Typos aren''t corrected. Examples: `ibira` (partial word),
+          `sao paulo` / `SÃO PAULO`, `tennis portugal` (name + address), `av paulista,
+          1000`.'
+        required: true
+      tags:
+      - Clubs
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedClubSearchResultList'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: '`q` missing/blank, too long, too many words, or no word of
+            3+ characters: `{"q": ["…"]}`.'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: '`page` isn''t a positive integer.'
+  /api/v1/courts/:
+    get:
+      operationId: courts_list
+      description: |2
+
+        Active courts the user may book — courts of **open** clubs plus **members-only**
+        clubs where the user has an active membership — each with its free slots.
+
+        Court filters and the availability window are AND-combined; comma-separated
+        values are OR-ed. **Window:** no date/time params → **today**; `date` → all
+        free slots that day; `date_from` + `date_to` → an inclusive range of at most
+        7 days; `time_from` / `time_to` → only slots fully inside this time of day,
+        each day. Dates/times are wall-clock in each club's timezone; past dates are
+        rejected. When any date/time param is given, courts with **no** free slot in
+        the window are omitted (e.g. a court taken by a tournament at that time);
+        without them every matching court is listed, with today's slots.
+
+        Each court lists:
+        - `is_singles_only` — a singles court: no doubles, at most 2 players;
+        - `available_slots` — its slots that haven't started and don't overlap an
+          active booking; each slot's `rules` lists the ids of the booking rules
+          covering it;
+        - `notices` — one-time overrides in the window (`type`, `notes`): why a day
+          differs from the usual schedule (e.g. no morning slots: a tournament);
+        - `booking_rules` — the rules its slots are subject to (`name`, `summary`,
+          e.g. "Women only"). Whether the user meets them is decided when booking.
+      summary: List bookable courts with their available slots
+      parameters:
+      - in: query
+        name: club
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Club ids.
+        explode: false
+        style: form
+      - in: query
+        name: date
+        schema:
+          type: string
+          format: date
+        description: A single day (not with date_from/date_to).
+      - in: query
+        name: date_from
+        schema:
+          type: string
+          format: date
+        description: First day of an inclusive range, with date_to (at most 7 days).
+      - in: query
+        name: date_to
+        schema:
+          type: string
+          format: date
+        description: Last day of the range (inclusive).
+      - in: query
+        name: is_indoor
+        schema:
+          type: boolean
+        description: Indoor (true) or outdoor (false) courts.
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - in: query
+        name: surface_type
+        schema:
+          type: array
+          items:
+            type: string
+            enum:
+            - CLAY
+            - GRASS
+            - HARD
+            - SYNTHETIC
+        description: |-
+          Court surfaces.
+
+          * `CLAY` - Clay
+          * `HARD` - Hard
+          * `GRASS` - Grass
+          * `SYNTHETIC` - Synthetic
+        explode: false
+        style: form
+      - in: query
+        name: time_from
+        schema:
+          type: string
+          format: time
+        description: Only slots fully inside time_from–time_to (HH:MM, club time),
+          each day.
+      - in: query
+        name: time_to
+        schema:
+          type: string
+          format: time
+        description: End of the time window (HH:MM; "24:00" = midnight).
+      tags:
+      - Courts
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedCourtAvailabilityList'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: 'Invalid input: `{"<field>": ["message", …]}` (or `non_field_errors`).'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+  /api/v1/courts/{court_pk}/overrides/:
+    get:
+      operationId: schedule_overrides_list
+      description: From today on by default.
+      summary: List a court's one-time overrides
+      parameters:
+      - in: path
+        name: court_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: query
+        name: date_from
+        schema:
+          type: string
+          format: date
+      - in: query
+        name: date_to
+        schema:
+          type: string
+          format: date
+      tags:
+      - Schedules
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ScheduleOverride'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: 'Invalid input: `{"<field>": ["message", …]}` (or `non_field_errors`).'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+  /api/v1/courts/{court_pk}/overrides/{day}/:
+    get:
+      operationId: schedule_overrides_retrieve
+      description: |-
+        GET    /api/v1/courts/<court>/overrides/<YYYY-MM-DD>/
+        PUT    — {"day_template": "<id>" | null (closed), "type": "TOURNAMENT",
+                  "notes": "Junior club championship until 14:00", "force": false};
+                 today or later. Creates or replaces the override for that date. The
+                 type and notes are shown to members (courts listing notices,
+                 booking errors). type: MAINTENANCE | WEATHER | TOURNAMENT | EVENT |
+                 HOLIDAY | OTHER.
+        DELETE — ?force=true; back to the weekly schedule (today or later).
+      summary: View a one-time override
+      parameters:
+      - in: path
+        name: court_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: path
+        name: day
+        schema:
+          type: string
+          format: date
+        description: The date (YYYY-MM-DD).
+        required: true
+      tags:
+      - Schedules
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleOverride'
+          description: ''
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+    put:
+      operationId: schedule_overrides_set
+      description: |2
+
+        Creates or replaces the override for that date (today or later): another
+        day template, or `null` to close the court. The `type` and `notes` are shown
+        to members (courts listing `notices`, booking errors).
+      summary: Set a one-time override
+      parameters:
+      - in: path
+        name: court_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: path
+        name: day
+        schema:
+          type: string
+          format: date
+        description: The date (YYYY-MM-DD).
+        required: true
+      tags:
+      - Schedules
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScheduleOverrideWriteRequest'
+            examples:
+              Tournament:
+                value:
+                  day_template: <afternoon template id>
+                  type: TOURNAMENT
+                  notes: Junior club championship until 14:00
+                  force: false
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/ScheduleOverrideWriteRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/ScheduleOverrideWriteRequest'
+        required: true
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleOverrideChange'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: 'Invalid input: `{"<field>": ["message", …]}` (or `non_field_errors`).'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleConflict'
+          description: 'Future bookings wouldn''t fit anymore: they''re listed. Pick
+            a later date, or resend with force.'
+    delete:
+      operationId: schedule_overrides_destroy
+      description: Back to the weekly schedule that day (today or later).
+      summary: Remove a one-time override
+      parameters:
+      - in: path
+        name: court_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: path
+        name: day
+        schema:
+          type: string
+          format: date
+        description: The date (YYYY-MM-DD).
+        required: true
+      - in: query
+        name: force
+        schema:
+          type: boolean
+        description: 'Proceed anyway: cancel future bookings that no longer fit (reported
+          in `cancelled_reservations`), or unlink booking rules (reported).'
+      tags:
+      - Schedules
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cancelled'
+          description: ''
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleConflict'
+          description: 'Future bookings wouldn''t fit anymore: they''re listed. Pick
+            a later date, or resend with force.'
+  /api/v1/courts/{court_pk}/schedules/:
+    get:
+      operationId: court_schedules_list
+      description: Past, current and planned versions (`state`), oldest first.
+      summary: List a court's weekly schedule versions
+      parameters:
+      - in: path
+        name: court_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Schedules
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CourtSchedule'
+          description: ''
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+    post:
+      operationId: court_schedules_create
+      description: |2
+
+        From `valid_from` (today or later). Weekdays are grouped by template;
+        weekdays not sent keep the template they have on `valid_from`; `null`
+        closes them. Without `valid_until` it lasts until the next planned version.
+        The version in effect is cut short (with `valid_until`, it resumes afterwards).
+      summary: Add a weekly schedule version
+      parameters:
+      - in: path
+        name: court_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Schedules
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CourtScheduleWriteRequest'
+            examples:
+              WorkdaysAndWeekend:
+                value:
+                  valid_from: '2030-03-01'
+                  days:
+                  - weekdays:
+                    - MONDAY
+                    - TUESDAY
+                    - WEDNESDAY
+                    - THURSDAY
+                    - FRIDAY
+                    day_template: <workdays id>
+                  - weekdays:
+                    - SATURDAY
+                    - SUNDAY
+                    day_template: <weekend id>
+                  force: false
+                summary: Workdays and weekend
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/CourtScheduleWriteRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/CourtScheduleWriteRequest'
+        required: true
+      security:
+      - cookieAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CourtScheduleChange'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: 'Invalid input: `{"<field>": ["message", …]}` (or `non_field_errors`).'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleConflict'
+          description: 'Future bookings wouldn''t fit anymore: they''re listed. Pick
+            a later date, or resend with force.'
+  /api/v1/courts/{court_pk}/schedules/{id}/:
+    get:
+      operationId: court_schedules_retrieve
+      description: |-
+        GET    /api/v1/courts/<court>/schedules/<id>/
+        DELETE /api/v1/courts/<court>/schedules/<id>/?force=true — planned versions
+               only; the version before it extends over the freed period.
+      summary: View a weekly schedule version
+      parameters:
+      - in: path
+        name: court_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Schedules
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CourtSchedule'
+          description: ''
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+    delete:
+      operationId: court_schedules_destroy
+      description: Versions starting today or later only; the version before it extends
+        over the freed period.
+      summary: Delete a planned schedule version
+      parameters:
+      - in: path
+        name: court_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: query
+        name: force
+        schema:
+          type: boolean
+        description: 'Proceed anyway: cancel future bookings that no longer fit (reported
+          in `cancelled_reservations`), or unlink booking rules (reported).'
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Schedules
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cancelled'
+          description: ''
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+        '409':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: Past version, or bookings in the way.
+  /api/v1/courts/{court_pk}/schedules/copy/:
+    post:
+      operationId: court_schedules_copy
+      description: |2
+
+        Gives other courts of the **same club** the weekly schedule this court has on
+        `valid_from` (all 7 days), as a new version on each. All-or-nothing; one-time
+        overrides aren't copied.
+      summary: Copy a court's weekly schedule to other courts
+      parameters:
+      - in: path
+        name: court_pk
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Schedules
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CopyScheduleRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/CopyScheduleRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/CopyScheduleRequest'
+        required: true
+      security:
+      - cookieAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CopyResult'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: 'Invalid input: `{"<field>": ["message", …]}` (or `non_field_errors`).'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not found — or not a club you administer (club admins and site
+            staff only).
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleConflict'
+          description: 'Future bookings wouldn''t fit anymore: they''re listed. Pick
+            a later date, or resend with force.'
+  /api/v1/me/:
+    get:
+      operationId: me_retrieve
+      description: The logged-in user's account — the only endpoint returning a user's
+        email (their own).
+      summary: My account
+      tags:
+      - Profile
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+          description: ''
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+  /api/v1/me/profile/picture/:
+    put:
+      operationId: me_profile_picture_update
+      description: |2
+
+        Uploads the logged-in player's profile picture (`multipart/form-data`, one
+        file field, `picture`) and replaces the previous one; the player profile is
+        created if the user has none yet.
+
+        - **Formats:** still **JPEG, PNG or WebP**, detected from the file's
+          content (the filename and content type sent are ignored). Animated
+          pictures (animated PNG or WebP) and GIF are rejected. Phone photos saved
+          as a JPEG with extra images appended (MPO: HDR gain map, depth map, …) are
+          accepted; only the photo is kept. Corrupt or truncated files, and images
+          above 40 megapixels, are rejected.
+        - **Size:** at most the server's `PLAYER_PICTURE_MAX_SIZE_KB` (default
+          2048 KB); a clearly larger request is refused
+          before its body is read. Downscale camera photos first (512–1024 px is
+          plenty for an avatar).
+        - **Metadata is removed:** the picture is re-encoded (same format) without
+          EXIF — camera, date, **GPS location** —, XMP, IPTC, comments and PNG text;
+          the orientation is applied first, so photos stay upright. The colour
+          profile and transparency are kept.
+        - Each upload gets a new `picture_key` (so CDN caches never serve an old
+          picture); `picture_url` is where to fetch it. The previous picture is
+          deleted.
+      summary: Set my profile picture
+      tags:
+      - Profile
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PictureUploadRequest'
+        required: true
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PictureSaved'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PictureError'
+          description: No file / empty file, not an image, unsupported format, animated,
+            corrupt, or too many pixels.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PictureError'
+          description: Larger than the size limit.
+        '415':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: The body isn't multipart/form-data.
+    delete:
+      operationId: me_profile_picture_destroy
+      description: The picture is removed from the profile and deleted from storage;
+        the rest of the profile is untouched. `204` also when there's no picture or
+        no profile — safe to retry.
+      summary: Remove my profile picture
+      tags:
+      - Profile
+      security:
+      - cookieAuth: []
+      responses:
+        '204':
+          description: Removed (or there was none).
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+  /api/v1/players/search/:
+    get:
+      operationId: players_search_list
+      description: |2
+
+        Players — **active** users with a player profile — whose name (first / last
+        name) or **location** (the profile's free-text location: neighbourhood,
+        city, state, country) contains every word of `q`.
+
+        Results show **only public details** — email, phone, birth date and gender
+        are neither returned nor searchable. `id` is the player's user id: pass it
+        in a booking's `guests` to add the player without knowing their email.
+        `picture_url` is `null` without a picture.
+
+        Best matches first: the name starts with the query, then the name contains it, then the name contains every word, then the rest; ties by name. Paginated **without a total count** (counting every match can cost as much as the search itself); a page past the end is empty.
+      summary: Find players by name and location
+      parameters:
+      - name: page
+        required: false
+        in: query
+        description: Page number (25 per page); a page past the end is empty.
+        schema:
+          type: integer
+          minimum: 1
+      - in: query
+        name: q
+        schema:
+          type: string
+        description: 'Words to find in the player''s name or location: every word
+          must appear, whole or partial, ignoring case and accents. Words are runs
+          of letters/digits (punctuation separates them); 1-character words are ignored;
+          at least one word needs 3+ characters (shorter ones still filter); at most
+          8 words and 100 characters. Typos aren''t corrected. Examples: `joao` /
+          `JOÃO`, `ana pinheiros`, `lisboa`.'
+        required: true
+      tags:
+      - Players
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedPlayerSearchResultList'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: '`q` missing/blank, too long, too many words, or no word of
+            3+ characters: `{"q": ["…"]}`.'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: '`page` isn''t a positive integer.'
+  /api/v1/reservations/:
+    get:
+      operationId: reservations_list
+      description: |2
+
+        The logged-in user's bookings — the ones they booked **and** the ones they're
+        a guest in (`role`: `owner` | `guest`). Filters are AND-combined;
+        comma-separated values within one are OR-ed; dates/times are wall-clock in
+        each club's timezone. `player` takes player ids and/or emails.
+
+        `state` is derived from the stored `status` and the clock, because played
+        bookings are never flipped to `COMPLETED` automatically: `upcoming`
+        (confirmed, not finished — includes a match in progress), `pending_payment`
+        (held, awaiting payment), `completed` (marked completed, or confirmed and
+        over), `cancelled`, `expired` (payment hold expired, or its slot passed).
+
+        Each booking includes `can_cancel` (for the requesting user) and
+        `cancellation_deadline`, so clients can show the policy before trying.
+      summary: My bookings
+      parameters:
+      - in: query
+        name: booking_type
+        schema:
+          type: array
+          items:
+            type: string
+            enum:
+            - BLOCKED
+            - DOUBLES
+            - LESSON
+            - SINGLES
+            - TOURNAMENT
+        description: |-
+          Booking types.
+
+          * `SINGLES` - Singles
+          * `DOUBLES` - Doubles
+          * `LESSON` - Lesson
+          * `TOURNAMENT` - Tournament
+          * `BLOCKED` - Blocked
+        explode: false
+        style: form
+      - in: query
+        name: club
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Club ids.
+        explode: false
+        style: form
+      - in: query
+        name: court
+        schema:
+          type: array
+          items:
+            type: string
+            format: uuid
+        description: Court ids.
+        explode: false
+        style: form
+      - in: query
+        name: date
+        schema:
+          type: string
+          format: date
+        description: Bookings on that day.
+      - in: query
+        name: date_from
+        schema:
+          type: string
+          format: date
+        description: On or after this day (inclusive; no range limit).
+      - in: query
+        name: date_to
+        schema:
+          type: string
+          format: date
+        description: On or before this day (inclusive).
+      - in: query
+        name: ordering
+        schema:
+          type: array
+          items:
+            type: string
+            enum:
+            - -created
+            - -price
+            - -start
+            - created
+            - price
+            - start
+        description: |-
+          Ordering
+
+          * `start` - Start
+          * `-start` - Start (descending)
+          * `created` - Created
+          * `-created` - Created (descending)
+          * `price` - Price
+          * `-price` - Price (descending)
+        explode: false
+        style: form
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - in: query
+        name: player
+        schema:
+          type: array
+          items:
+            type: string
+        description: Player ids or emails (mixed); booker or guest.
+        explode: false
+        style: form
+      - in: query
+        name: role
+        schema:
+          type: string
+          enum:
+          - guest
+          - owner
+        description: |-
+          What you are in the booking: the booker (owner) or a guest.
+
+          * `owner` - owner
+          * `guest` - guest
+      - in: query
+        name: state
+        schema:
+          type: array
+          items:
+            type: string
+            enum:
+            - cancelled
+            - completed
+            - expired
+            - pending_payment
+            - upcoming
+        description: |-
+          Lifecycle states, derived from the status and the clock.
+
+          * `upcoming` - Upcoming
+          * `pending_payment` - Pending payment
+          * `completed` - Completed
+          * `cancelled` - Cancelled
+          * `expired` - Expired
+        explode: false
+        style: form
+      - in: query
+        name: time_from
+        schema:
+          type: string
+          format: time
+        description: Starting at or after this time of day (HH:MM, club time).
+      - in: query
+        name: time_to
+        schema:
+          type: string
+          format: time
+        description: Ending at or before this time of day (HH:MM, club time).
+      tags:
+      - Reservations
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedReservationList'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: 'Invalid input: `{"<field>": ["message", …]}` (or `non_field_errors`).'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+    post:
+      operationId: reservations_create
+      description: |2
+
+        Books a court for the logged-in user (the booker). `date`, `start_time` and
+        `end_time` are wall-clock in the **club's timezone**; the time must be free
+        and match the court's slots — exactly what the courts listing returns as
+        `available_slots`. Several consecutive slots can be booked at once (e.g.
+        18:00–20:00): it starts when a slot starts, ends when a slot ends, and can't
+        span a gap.
+
+        `guests` (optional, max 3) takes each player **by email or by player id**,
+        mixed; the same player given twice is one guest. On a **singles court**
+        (`is_singles_only`): no doubles, at most 2 players (you and 1 guest).
+
+        The booking must meet the club's **booking rules** (every broken rule is
+        listed in the `400`). Payment isn't implemented yet, so bookings are
+        `CONFIRMED` immediately.
+      summary: Book a court
+      tags:
+      - Reservations
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReservationCreateRequest'
+            examples:
+              DoublesWithGuests:
+                value:
+                  court: <court id>
+                  date: '2030-01-08'
+                  start_time: '18:00'
+                  end_time: '19:00'
+                  booking_type: DOUBLES
+                  includes_lighting: true
+                  guests:
+                  - friend@example.com
+                  - <player id>
+                  notes: Bring balls
+                summary: Doubles with guests
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/ReservationCreateRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/ReservationCreateRequest'
+        required: true
+      security:
+      - cookieAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Reservation'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NonFieldErrors'
+          description: 'Invalid input (per field, e.g. `guests`: `Not a player id
+            or email: ''…''`, `No registered player with email/id: …`, yourself),
+            or not bookable (`non_field_errors`): past, not matching the court''s
+            slots — when a one-time override changed that day, the message says why
+            (e.g. "… — Tournament: Junior club championship until 14:00.") —, lighting
+            unavailable, a singles court with a doubles booking or more than 2 players,
+            or broken booking rules. A court you can''t book (e.g. members-only) is
+            reported as not existing.'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in (or, for writes, no CSRF token).
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NonFieldErrors'
+          description: The slot is already taken (also when two people book it at
+            the same moment).
+  /api/v1/reservations/{id}/cancel/:
+    post:
+      operationId: reservations_cancel_create
+      description: |2
+
+        Keeps the booking (status `CANCELLED`, with `cancelled_at` and
+        `cancellation_reason`) and frees the slot; the booker and guests are
+        notified. Only the booker can cancel — not guests. Policy, per club
+        (`cancellation_window_hours`, default 24): a confirmed booking until
+        `start − window` (0 = until the start); an unpaid hold any time before the
+        start; started, finished, expired or completed bookings never. Repeating the
+        call on a booking you already cancelled returns `200` (safe to retry).
+      summary: Cancel a booking
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - Reservations
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReservationCancelRequest'
+            examples:
+              Reason:
+                value:
+                  reason: Rain forecast
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/ReservationCancelRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/ReservationCancelRequest'
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Reservation'
+          description: ''
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Not logged in, or you're a guest in this booking.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: No such booking, or you're not in it.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Detail'
+          description: Can't be cancelled — the message says why (e.g. the deadline
+            passed, with the club's policy).
+components:
+  schemas:
+    AccessTypeEnum:
+      enum:
+      - OPEN
+      - MEMBERS_ONLY
+      type: string
+      description: |-
+        * `OPEN` - Open to all players
+        * `MEMBERS_ONLY` - Members only
+    Account:
+      type: object
+      description: The logged-in user's own account — the only place a user's email
+        is returned.
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        email:
+          type: string
+          format: email
+          readOnly: true
+          title: Email address
+        first_name:
+          type: string
+          readOnly: true
+        last_name:
+          type: string
+          readOnly: true
+        has_password:
+          type: boolean
+          readOnly: true
+          description: False for an account that logs in with codes only (it can set
+            one via the password reset).
+      required:
+      - email
+      - first_name
+      - has_password
+      - id
+      - last_name
+    ApprovalStatusEnum:
+      enum:
+      - PENDING
+      - APPROVED
+      - REJECTED
+      type: string
+      description: |-
+        * `PENDING` - Awaiting approval
+        * `APPROVED` - Approved
+        * `REJECTED` - Rejected
+    BookingRule:
+      type: object
+      description: |-
+        A club's booking rule, for club admins (read and write). Where it applies:
+        linked `courts`, `day_templates` (slot configurations) and `slots` (single
+        slots of day templates) — ids of this club's; nothing linked = the whole
+        club; each kind of link narrows it. `valid_from` / `valid_until`: when
+        it's in force. `kind` + `params`: see GET /api/v1/booking-rule-kinds/.
+        Expects `context["club"]`.
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        name:
+          type: string
+          description: Shown to players, e.g. "Women's evening".
+          maxLength: 100
+        kind:
+          type: string
+          description: What the rule requires — see the booking rule kinds.
+          maxLength: 50
+        params: {}
+        summary:
+          type: string
+          readOnly: true
+        courts:
+          type: array
+          items:
+            type: string
+            format: uuid
+        day_templates:
+          type: array
+          items:
+            type: string
+            format: uuid
+        slots:
+          type: array
+          items:
+            type: string
+            format: uuid
+        valid_from:
+          type: string
+          format: date
+          nullable: true
+        valid_until:
+          type: string
+          format: date
+          nullable: true
+          description: Last day the rule applies (inclusive).
+        is_active:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - created_at
+      - id
+      - kind
+      - name
+      - summary
+      - updated_at
+    BookingRuleInfo:
+      type: object
+      description: 'A booking rule as players see it: {"id", "name", "kind", "summary"}.'
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        kind:
+          type: string
+        summary:
+          type: string
+      required:
+      - id
+      - kind
+      - name
+      - summary
+    BookingRuleKind:
+      type: object
+      properties:
+        kind:
+          type: string
+        label:
+          type: string
+        description:
+          type: string
+        params:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties: {}
+          description: Param name → its type, required, default, choices, …
+      required:
+      - description
+      - kind
+      - label
+      - params
+    BookingRuleRequest:
+      type: object
+      description: |-
+        A club's booking rule, for club admins (read and write). Where it applies:
+        linked `courts`, `day_templates` (slot configurations) and `slots` (single
+        slots of day templates) — ids of this club's; nothing linked = the whole
+        club; each kind of link narrows it. `valid_from` / `valid_until`: when
+        it's in force. `kind` + `params`: see GET /api/v1/booking-rule-kinds/.
+        Expects `context["club"]`.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: Shown to players, e.g. "Women's evening".
+          maxLength: 100
+        kind:
+          type: string
+          minLength: 1
+          description: What the rule requires — see the booking rule kinds.
+          maxLength: 50
+        params: {}
+        courts:
+          type: array
+          items:
+            type: string
+            format: uuid
+        day_templates:
+          type: array
+          items:
+            type: string
+            format: uuid
+        slots:
+          type: array
+          items:
+            type: string
+            format: uuid
+        valid_from:
+          type: string
+          format: date
+          nullable: true
+        valid_until:
+          type: string
+          format: date
+          nullable: true
+          description: Last day the rule applies (inclusive).
+        is_active:
+          type: boolean
+      required:
+      - kind
+      - name
+    Cancelled:
+      type: object
+      properties:
+        cancelled_reservations:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReservationSummary'
+          description: Future bookings cancelled by force (no longer fitting).
+      required:
+      - cancelled_reservations
+    Challenge:
+      type: object
+      description: A code was emailed (if the email is registered — or, for signups,
+        in any case).
+      properties:
+        challenge_id:
+          type: string
+          format: uuid
+          description: Send it back with the code.
+        expires_at:
+          type: string
+          format: date-time
+        detail:
+          type: string
+      required:
+      - challenge_id
+      - detail
+      - expires_at
+    Club:
+      type: object
+      description: Full club representation (registration response and club detail).
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        name:
+          type: string
+          readOnly: true
+        slug:
+          type: string
+          readOnly: true
+          pattern: ^[-a-zA-Z0-9_]+$
+        address:
+          type: string
+          readOnly: true
+        timezone:
+          type: string
+          readOnly: true
+        access_type:
+          allOf:
+          - $ref: '#/components/schemas/AccessTypeEnum'
+          readOnly: true
+          description: |-
+            Members-only clubs restrict court visibility and booking to members.
+
+            * `OPEN` - Open to all players
+            * `MEMBERS_ONLY` - Members only
+        cancellation_window_hours:
+          type: integer
+          readOnly: true
+          description: 'Cancellation policy: players can cancel a confirmed booking
+            up to this many hours before it starts. 0 = until the start time.'
+        is_active:
+          type: boolean
+          readOnly: true
+        approval_status:
+          allOf:
+          - $ref: '#/components/schemas/ApprovalStatusEnum'
+          readOnly: true
+          description: |-
+            Pending and rejected clubs are hidden from players (search, courts, booking).
+
+            * `PENDING` - Awaiting approval
+            * `APPROVED` - Approved
+            * `REJECTED` - Rejected
+        rejection_reason:
+          type: string
+          readOnly: true
+          description: Why the club wasn't approved (sent to whoever registered it).
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - access_type
+      - address
+      - approval_status
+      - cancellation_window_hours
+      - created_at
+      - id
+      - is_active
+      - name
+      - rejection_reason
+      - slug
+      - timezone
+      - updated_at
+    ClubRegistrant:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        first_name:
+          type: string
+        last_name:
+          type: string
+      required:
+      - first_name
+      - id
+      - last_name
+    ClubRegistrationRequest:
+      type: object
+      description: |-
+        Input for registering a club: only its name and address. Everything else
+        starts at the model defaults and is set later by editing the club; other
+        fields in the request body are ignored.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        address:
+          type: string
+          minLength: 1
+      required:
+      - address
+      - name
+    ClubRejectRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          description: Sent to whoever registered the club.
+          maxLength: 500
+      required:
+      - reason
+    ClubReview:
+      type: object
+      description: 'A club as site staff review it: plus who registered it (a player
+        summary — no email) and when it was reviewed.'
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        name:
+          type: string
+          readOnly: true
+        slug:
+          type: string
+          readOnly: true
+          pattern: ^[-a-zA-Z0-9_]+$
+        address:
+          type: string
+          readOnly: true
+        timezone:
+          type: string
+          readOnly: true
+        access_type:
+          allOf:
+          - $ref: '#/components/schemas/AccessTypeEnum'
+          readOnly: true
+          description: |-
+            Members-only clubs restrict court visibility and booking to members.
+
+            * `OPEN` - Open to all players
+            * `MEMBERS_ONLY` - Members only
+        cancellation_window_hours:
+          type: integer
+          readOnly: true
+          description: 'Cancellation policy: players can cancel a confirmed booking
+            up to this many hours before it starts. 0 = until the start time.'
+        is_active:
+          type: boolean
+          readOnly: true
+        approval_status:
+          allOf:
+          - $ref: '#/components/schemas/ApprovalStatusEnum'
+          readOnly: true
+          description: |-
+            Pending and rejected clubs are hidden from players (search, courts, booking).
+
+            * `PENDING` - Awaiting approval
+            * `APPROVED` - Approved
+            * `REJECTED` - Rejected
+        rejection_reason:
+          type: string
+          readOnly: true
+          description: Why the club wasn't approved (sent to whoever registered it).
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+        registered_by:
+          allOf:
+          - $ref: '#/components/schemas/ClubRegistrant'
+          nullable: true
+          readOnly: true
+        reviewed_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+      required:
+      - access_type
+      - address
+      - approval_status
+      - cancellation_window_hours
+      - created_at
+      - id
+      - is_active
+      - name
+      - registered_by
+      - rejection_reason
+      - reviewed_at
+      - slug
+      - timezone
+      - updated_at
+    ClubSearchResult:
+      type: object
+      description: A club in search results (GET /api/v1/clubs/search/).
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        name:
+          type: string
+          readOnly: true
+        slug:
+          type: string
+          readOnly: true
+          pattern: ^[-a-zA-Z0-9_]+$
+        address:
+          type: string
+          readOnly: true
+        timezone:
+          type: string
+          readOnly: true
+        access_type:
+          allOf:
+          - $ref: '#/components/schemas/AccessTypeEnum'
+          readOnly: true
+          description: |-
+            Members-only clubs restrict court visibility and booking to members.
+
+            * `OPEN` - Open to all players
+            * `MEMBERS_ONLY` - Members only
+      required:
+      - access_type
+      - address
+      - id
+      - name
+      - slug
+      - timezone
+    ClubSummary:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        name:
+          type: string
+          maxLength: 255
+        slug:
+          type: string
+          maxLength: 255
+          pattern: ^[-a-zA-Z0-9_]+$
+        timezone:
+          type: string
+          maxLength: 64
+        access_type:
+          allOf:
+          - $ref: '#/components/schemas/AccessTypeEnum'
+          description: |-
+            Members-only clubs restrict court visibility and booking to members.
+
+            * `OPEN` - Open to all players
+            * `MEMBERS_ONLY` - Members only
+      required:
+      - id
+      - name
+      - slug
+    CodeError:
+      type: object
+      properties:
+        code:
+          type: array
+          items:
+            type: string
+      required:
+      - code
+    CodeRequest:
+      type: object
+      properties:
+        challenge_id:
+          type: string
+          format: uuid
+        code:
+          type: string
+          minLength: 1
+          description: The 6-digit code from the email.
+          maxLength: 12
+      required:
+      - challenge_id
+      - code
+    CopiedSchedule:
+      type: object
+      description: 'A schedule version: its period, state, and weekdays grouped by
+        day template.'
+      properties:
+        court:
+          type: string
+          format: uuid
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        valid_from:
+          type: string
+          format: date
+        valid_until:
+          type: string
+          format: date
+          nullable: true
+        state:
+          type: string
+          readOnly: true
+          description: past | current | planned
+        days:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScheduleDays'
+          readOnly: true
+      required:
+      - court
+      - days
+      - id
+      - state
+      - valid_from
+    CopyResult:
+      type: object
+      properties:
+        schedules:
+          type: array
+          items:
+            $ref: '#/components/schemas/CopiedSchedule'
+        cancelled_reservations:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReservationSummary'
+      required:
+      - cancelled_reservations
+      - schedules
+    CopyScheduleRequest:
+      type: object
+      properties:
+        courts:
+          type: array
+          items:
+            type: string
+            format: uuid
+        valid_from:
+          type: string
+          format: date
+        valid_until:
+          type: string
+          format: date
+          nullable: true
+        force:
+          type: boolean
+          default: false
+      required:
+      - courts
+      - valid_from
+    Court:
+      type: object
+      description: |-
+        A court, for its club's admins (read and write). Editable: everything but
+        the club. `force` (write-only): deactivating a court with future bookings
+        cancels them (otherwise 409). Expects `context["club"]` and, when
+        editing, the instance.
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        name:
+          type: string
+          description: e.g. "Court 1 - Guga"
+          maxLength: 128
+        surface_type:
+          $ref: '#/components/schemas/SurfaceTypeEnum'
+        is_indoor:
+          type: boolean
+        is_singles_only:
+          type: boolean
+          description: 'A singles court (e.g. too narrow for doubles): bookings can''t
+            be doubles and take at most 2 players — the booker and 1 guest.'
+        has_lighting:
+          type: boolean
+        hourly_rate:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,8}(?:\.\d{0,2})?$
+        lighting_fee:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,8}(?:\.\d{0,2})?$
+        is_active:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - created_at
+      - id
+      - name
+      - updated_at
+    CourtAvailability:
+      type: object
+      description: |-
+        Court + its available slots, notices and the booking rules its slots refer
+        to. Expects `context["availability"]`: a mapping of court id -> CourtSlots.
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        name:
+          type: string
+          description: e.g. "Court 1 - Guga"
+          maxLength: 128
+        surface_type:
+          $ref: '#/components/schemas/SurfaceTypeEnum'
+        is_indoor:
+          type: boolean
+        is_singles_only:
+          type: boolean
+          description: 'A singles court (e.g. too narrow for doubles): bookings can''t
+            be doubles and take at most 2 players — the booker and 1 guest.'
+        has_lighting:
+          type: boolean
+        hourly_rate:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,8}(?:\.\d{0,2})?$
+        lighting_fee:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,8}(?:\.\d{0,2})?$
+        club:
+          allOf:
+          - $ref: '#/components/schemas/ClubSummary'
+          readOnly: true
+        available_slots:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimeSlot'
+          readOnly: true
+        notices:
+          type: array
+          items:
+            $ref: '#/components/schemas/Notice'
+          readOnly: true
+        booking_rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/BookingRuleInfo'
+          readOnly: true
+      required:
+      - available_slots
+      - booking_rules
+      - club
+      - id
+      - name
+      - notices
+    CourtChange:
+      type: object
+      description: |-
+        A court, for its club's admins (read and write). Editable: everything but
+        the club. `force` (write-only): deactivating a court with future bookings
+        cancels them (otherwise 409). Expects `context["club"]` and, when
+        editing, the instance.
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        name:
+          type: string
+          description: e.g. "Court 1 - Guga"
+          maxLength: 128
+        surface_type:
+          $ref: '#/components/schemas/SurfaceTypeEnum'
+        is_indoor:
+          type: boolean
+        is_singles_only:
+          type: boolean
+          description: 'A singles court (e.g. too narrow for doubles): bookings can''t
+            be doubles and take at most 2 players — the booker and 1 guest.'
+        has_lighting:
+          type: boolean
+        hourly_rate:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,8}(?:\.\d{0,2})?$
+        lighting_fee:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,8}(?:\.\d{0,2})?$
+        is_active:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+        cancelled_reservations:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReservationSummary'
+          description: Future bookings cancelled by force (deactivating the court).
+      required:
+      - cancelled_reservations
+      - created_at
+      - id
+      - name
+      - updated_at
+    CourtRequest:
+      type: object
+      description: |-
+        A court, for its club's admins (read and write). Editable: everything but
+        the club. `force` (write-only): deactivating a court with future bookings
+        cancels them (otherwise 409). Expects `context["club"]` and, when
+        editing, the instance.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: e.g. "Court 1 - Guga"
+          maxLength: 128
+        surface_type:
+          $ref: '#/components/schemas/SurfaceTypeEnum'
+        is_indoor:
+          type: boolean
+        is_singles_only:
+          type: boolean
+          description: 'A singles court (e.g. too narrow for doubles): bookings can''t
+            be doubles and take at most 2 players — the booker and 1 guest.'
+        has_lighting:
+          type: boolean
+        hourly_rate:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,8}(?:\.\d{0,2})?$
+        lighting_fee:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,8}(?:\.\d{0,2})?$
+        is_active:
+          type: boolean
+        force:
+          type: boolean
+          writeOnly: true
+          default: false
+          description: 'Deactivating a court with future bookings: cancel them (otherwise
+            409).'
+      required:
+      - name
+    CourtSchedule:
+      type: object
+      description: 'A schedule version: its period, state, and weekdays grouped by
+        day template.'
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        valid_from:
+          type: string
+          format: date
+        valid_until:
+          type: string
+          format: date
+          nullable: true
+        state:
+          type: string
+          readOnly: true
+          description: past | current | planned
+        days:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScheduleDays'
+          readOnly: true
+      required:
+      - days
+      - id
+      - state
+      - valid_from
+    CourtScheduleChange:
+      type: object
+      description: 'A schedule version: its period, state, and weekdays grouped by
+        day template.'
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        valid_from:
+          type: string
+          format: date
+        valid_until:
+          type: string
+          format: date
+          nullable: true
+        state:
+          type: string
+          readOnly: true
+          description: past | current | planned
+        days:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScheduleDays'
+          readOnly: true
+        cancelled_reservations:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReservationSummary'
+      required:
+      - cancelled_reservations
+      - days
+      - id
+      - state
+      - valid_from
+    CourtScheduleWriteRequest:
+      type: object
+      properties:
+        valid_from:
+          type: string
+          format: date
+        valid_until:
+          type: string
+          format: date
+          nullable: true
+        days:
+          type: array
+          items:
+            $ref: '#/components/schemas/WeekdaysAssignmentRequest'
+        force:
+          type: boolean
+          default: false
+          description: Cancel future bookings that no longer fit.
+      required:
+      - days
+      - valid_from
+    CsrfToken:
+      type: object
+      properties:
+        csrf_token:
+          type: string
+      required:
+      - csrf_token
+    DayTemplate:
+      type: object
+      description: '{"id", "name", "slots": [{"start": "06:00", "end": "07:00"}, ...],
+        "locked"}'
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        name:
+          type: string
+          maxLength: 100
+        slots:
+          type: array
+          items:
+            $ref: '#/components/schemas/Slot'
+          readOnly: true
+        locked:
+          type: boolean
+          readOnly: true
+          description: 'True once the template has been in effect: its slots can no
+            longer change.'
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - created_at
+      - id
+      - locked
+      - name
+      - slots
+      - updated_at
+    DayTemplateChange:
+      type: object
+      description: '{"id", "name", "slots": [{"start": "06:00", "end": "07:00"}, ...],
+        "locked"}'
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        name:
+          type: string
+          maxLength: 100
+        slots:
+          type: array
+          items:
+            $ref: '#/components/schemas/Slot'
+          readOnly: true
+        locked:
+          type: boolean
+          readOnly: true
+          description: 'True once the template has been in effect: its slots can no
+            longer change.'
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+        cancelled_reservations:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReservationSummary'
+        unlinked_booking_rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuleRef'
+        deactivated_booking_rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuleRef'
+      required:
+      - created_at
+      - id
+      - locked
+      - name
+      - slots
+      - updated_at
+    DayTemplateWriteRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        slots:
+          type: array
+          items:
+            $ref: '#/components/schemas/SlotRequest'
+        force:
+          type: boolean
+          default: false
+          description: Cancel future bookings that no longer fit.
+      required:
+      - name
+      - slots
+    Detail:
+      type: object
+      properties:
+        detail:
+          type: string
+      required:
+      - detail
+    EmailRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+          minLength: 1
+      required:
+      - email
+    LinkedToRules:
+      type: object
+      properties:
+        detail:
+          type: string
+        booking_rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuleRef'
+        hint:
+          type: string
+      required:
+      - booking_rules
+      - detail
+      - hint
+    NonFieldErrors:
+      type: object
+      properties:
+        non_field_errors:
+          type: array
+          items:
+            type: string
+      required:
+      - non_field_errors
+    Notice:
+      type: object
+      description: 'Why a day differs from the weekly schedule: a one-time override''s
+        type and notes.'
+      properties:
+        date:
+          type: string
+          format: date
+        type:
+          type: string
+        notes:
+          type: string
+      required:
+      - date
+      - notes
+      - type
+    PaginatedClubReviewList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClubReview'
+    PaginatedClubSearchResultList:
+      type: object
+      required:
+      - results
+      properties:
+        next:
+          type: string
+          nullable: true
+          format: uri
+        previous:
+          type: string
+          nullable: true
+          format: uri
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClubSearchResult'
+    PaginatedCourtAvailabilityList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/CourtAvailability'
+    PaginatedPlayerSearchResultList:
+      type: object
+      required:
+      - results
+      properties:
+        next:
+          type: string
+          nullable: true
+          format: uri
+        previous:
+          type: string
+          nullable: true
+          format: uri
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlayerSearchResult'
+    PaginatedReservationList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/Reservation'
+    PasswordLoginRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+          minLength: 1
+        password:
+          type: string
+          writeOnly: true
+          minLength: 1
+      required:
+      - email
+      - password
+    PasswordResetConfirmRequest:
+      type: object
+      properties:
+        challenge_id:
+          type: string
+          format: uuid
+        code:
+          type: string
+          minLength: 1
+          description: The 6-digit code from the email.
+          maxLength: 12
+        new_password:
+          type: string
+          writeOnly: true
+          minLength: 1
+      required:
+      - challenge_id
+      - code
+      - new_password
+    PatchedBookingRuleRequest:
+      type: object
+      description: |-
+        A club's booking rule, for club admins (read and write). Where it applies:
+        linked `courts`, `day_templates` (slot configurations) and `slots` (single
+        slots of day templates) — ids of this club's; nothing linked = the whole
+        club; each kind of link narrows it. `valid_from` / `valid_until`: when
+        it's in force. `kind` + `params`: see GET /api/v1/booking-rule-kinds/.
+        Expects `context["club"]`.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: Shown to players, e.g. "Women's evening".
+          maxLength: 100
+        kind:
+          type: string
+          minLength: 1
+          description: What the rule requires — see the booking rule kinds.
+          maxLength: 50
+        params: {}
+        courts:
+          type: array
+          items:
+            type: string
+            format: uuid
+        day_templates:
+          type: array
+          items:
+            type: string
+            format: uuid
+        slots:
+          type: array
+          items:
+            type: string
+            format: uuid
+        valid_from:
+          type: string
+          format: date
+          nullable: true
+        valid_until:
+          type: string
+          format: date
+          nullable: true
+          description: Last day the rule applies (inclusive).
+        is_active:
+          type: boolean
+    PatchedClubUpdateRequest:
+      type: object
+      description: |-
+        Input for editing a club: every setting except `name` and `address` —
+        changing those goes through support instead, since the name anchors the
+        slug and both may be referenced outside this API.
+      properties:
+        timezone:
+          type: string
+          minLength: 1
+          maxLength: 64
+        access_type:
+          allOf:
+          - $ref: '#/components/schemas/AccessTypeEnum'
+          description: |-
+            Members-only clubs restrict court visibility and booking to members.
+
+            * `OPEN` - Open to all players
+            * `MEMBERS_ONLY` - Members only
+        cancellation_window_hours:
+          type: integer
+          maximum: 2147483647
+          minimum: 0
+          description: 'Cancellation policy: players can cancel a confirmed booking
+            up to this many hours before it starts. 0 = until the start time.'
+        is_active:
+          type: boolean
+    PatchedCourtRequest:
+      type: object
+      description: |-
+        A court, for its club's admins (read and write). Editable: everything but
+        the club. `force` (write-only): deactivating a court with future bookings
+        cancels them (otherwise 409). Expects `context["club"]` and, when
+        editing, the instance.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: e.g. "Court 1 - Guga"
+          maxLength: 128
+        surface_type:
+          $ref: '#/components/schemas/SurfaceTypeEnum'
+        is_indoor:
+          type: boolean
+        is_singles_only:
+          type: boolean
+          description: 'A singles court (e.g. too narrow for doubles): bookings can''t
+            be doubles and take at most 2 players — the booker and 1 guest.'
+        has_lighting:
+          type: boolean
+        hourly_rate:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,8}(?:\.\d{0,2})?$
+        lighting_fee:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,8}(?:\.\d{0,2})?$
+        is_active:
+          type: boolean
+        force:
+          type: boolean
+          writeOnly: true
+          default: false
+          description: 'Deactivating a court with future bookings: cancel them (otherwise
+            409).'
+    PatchedDayTemplateWriteRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        slots:
+          type: array
+          items:
+            $ref: '#/components/schemas/SlotRequest'
+        force:
+          type: boolean
+          default: false
+          description: Cancel future bookings that no longer fit.
+    PictureError:
+      type: object
+      properties:
+        picture:
+          type: array
+          items:
+            type: string
+      required:
+      - picture
+    PictureSaved:
+      type: object
+      properties:
+        picture_key:
+          type: string
+          description: Key in the file storage.
+        picture_url:
+          type: string
+          format: uri
+      required:
+      - picture_key
+      - picture_url
+    PictureUploadRequest:
+      type: object
+      description: Input for PUT /api/v1/me/profile/picture/ (multipart). Format and
+        size are checked by the service.
+      properties:
+        picture:
+          type: string
+          format: binary
+      required:
+      - picture
+    PlayerSearchResult:
+      type: object
+      description: |-
+        A player in search results (GET /api/v1/players/search/): only what other
+        players may see — no email, phone, birth date or gender.
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+          description: The player's user id.
+        first_name:
+          type: string
+          readOnly: true
+        last_name:
+          type: string
+          readOnly: true
+        location:
+          type: string
+          readOnly: true
+          description: 'Where the player plays, free text: neighbourhood, city, state,
+            country — e.g. "Pinheiros, São Paulo - SP, Brasil". Shown to other players
+            and searchable: city level, no street address.'
+        skill_level:
+          allOf:
+          - $ref: '#/components/schemas/SkillLevelEnum'
+          readOnly: true
+        picture_url:
+          type: string
+          format: uri
+          nullable: true
+          readOnly: true
+      required:
+      - first_name
+      - id
+      - last_name
+      - location
+      - picture_url
+      - skill_level
+    PlayerSummary:
+      type: object
+      description: |-
+        How the API shows a player anywhere outside their own profile: id and
+        name only. Emails are never returned (only a player's own profile may show
+        theirs); the id is what API input accepts to refer to a player.
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        first_name:
+          type: string
+          readOnly: true
+        last_name:
+          type: string
+          readOnly: true
+      required:
+      - first_name
+      - id
+      - last_name
+    Reservation:
+      type: object
+      description: |-
+        Output representation; times are ISO-8601 in the club's timezone.
+
+        `status` is the stored status; `state` is the lifecycle bucket derived from
+        status + time (what the `state` filter uses). `role` is relative to the
+        requesting user: "owner" (booked it) or "guest". `can_cancel` says whether
+        the requesting user may cancel it right now; `cancellation_deadline` is the
+        club policy's cutoff for confirmed bookings.
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        court:
+          allOf:
+          - $ref: '#/components/schemas/ReservedCourt'
+          readOnly: true
+        start:
+          type: string
+          format: date-time
+          readOnly: true
+        end:
+          type: string
+          format: date-time
+          readOnly: true
+        booking_type:
+          $ref: '#/components/schemas/ReservationBookingTypeEnum'
+        status:
+          $ref: '#/components/schemas/StatusEnum'
+        state:
+          allOf:
+          - $ref: '#/components/schemas/StateEnum'
+          readOnly: true
+        role:
+          allOf:
+          - $ref: '#/components/schemas/RoleEnum'
+          readOnly: true
+        primary_player:
+          allOf:
+          - $ref: '#/components/schemas/PlayerSummary'
+          readOnly: true
+        includes_lighting:
+          type: boolean
+        total_price:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,8}(?:\.\d{0,2})?$
+        guests:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlayerSummary'
+          readOnly: true
+        notes:
+          type: string
+        can_cancel:
+          type: boolean
+          readOnly: true
+        cancellation_deadline:
+          type: string
+          format: date-time
+          readOnly: true
+        cancelled_at:
+          type: string
+          format: date-time
+          nullable: true
+        cancellation_reason:
+          type: string
+          maxLength: 500
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - can_cancel
+      - cancellation_deadline
+      - court
+      - created_at
+      - end
+      - guests
+      - id
+      - primary_player
+      - role
+      - start
+      - state
+    ReservationBookingTypeEnum:
+      enum:
+      - SINGLES
+      - DOUBLES
+      - LESSON
+      - TOURNAMENT
+      - BLOCKED
+      type: string
+      description: |-
+        * `SINGLES` - Singles
+        * `DOUBLES` - Doubles
+        * `LESSON` - Lesson
+        * `TOURNAMENT` - Tournament
+        * `BLOCKED` - Blocked
+    ReservationCancelRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          default: ''
+          maxLength: 500
+    ReservationCreateBookingTypeEnum:
+      enum:
+      - SINGLES
+      - DOUBLES
+      - LESSON
+      type: string
+      description: |-
+        * `SINGLES` - Singles
+        * `DOUBLES` - Doubles
+        * `LESSON` - Lesson
+    ReservationCreateRequest:
+      type: object
+      description: |-
+        Input for booking a court. Date and times are wall-clock values in the
+        court's club timezone (same convention as the courts listing filters).
+      properties:
+        court:
+          type: string
+          format: uuid
+        date:
+          type: string
+          format: date
+        start_time:
+          type: string
+          format: time
+        end_time:
+          type: string
+          format: time
+          description: Use "24:00" for a booking ending at midnight.
+        booking_type:
+          allOf:
+          - $ref: '#/components/schemas/ReservationCreateBookingTypeEnum'
+          default: SINGLES
+        includes_lighting:
+          type: boolean
+          default: false
+        guests:
+          type: array
+          items:
+            type: string
+            minLength: 1
+          description: Registered players joining the booking, each given by email
+            or by player id (the user id, as returned by the player search) — both
+            can be mixed.
+          maxItems: 3
+        notes:
+          type: string
+          default: ''
+          maxLength: 500
+      required:
+      - court
+      - date
+      - end_time
+      - start_time
+    ReservationSummary:
+      type: object
+      description: A booking a schedule change affects.
+      properties:
+        id:
+          type: string
+          format: uuid
+        court:
+          type: string
+          format: uuid
+        court_name:
+          type: string
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+        primary_player:
+          $ref: '#/components/schemas/PlayerSummary'
+        status:
+          type: string
+      required:
+      - court
+      - court_name
+      - end
+      - id
+      - primary_player
+      - start
+      - status
+    ReservedCourt:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        name:
+          type: string
+          description: e.g. "Court 1 - Guga"
+          maxLength: 128
+        surface_type:
+          $ref: '#/components/schemas/SurfaceTypeEnum'
+        is_indoor:
+          type: boolean
+        is_singles_only:
+          type: boolean
+          description: 'A singles court (e.g. too narrow for doubles): bookings can''t
+            be doubles and take at most 2 players — the booker and 1 guest.'
+        club:
+          allOf:
+          - $ref: '#/components/schemas/ClubSummary'
+          readOnly: true
+      required:
+      - club
+      - id
+      - name
+    RoleEnum:
+      type: string
+      enum:
+      - owner
+      - guest
+    RuleRef:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+      required:
+      - id
+      - name
+    ScheduleConflict:
+      type: object
+      properties:
+        detail:
+          type: string
+        conflicting_reservations:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReservationSummary'
+        hint:
+          type: string
+      required:
+      - conflicting_reservations
+      - detail
+      - hint
+    ScheduleDays:
+      type: object
+      properties:
+        weekdays:
+          type: array
+          items:
+            $ref: '#/components/schemas/WeekdaysEnum'
+        day_template:
+          allOf:
+          - $ref: '#/components/schemas/TemplateRef'
+          nullable: true
+          description: null = closed those days.
+      required:
+      - day_template
+      - weekdays
+    ScheduleOverride:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date
+        type:
+          $ref: '#/components/schemas/TypeEnum'
+        notes:
+          type: string
+          description: Shown to members, e.g. "Junior club championship until 14:00".
+          maxLength: 500
+        day_template:
+          allOf:
+          - $ref: '#/components/schemas/TemplateRef'
+          nullable: true
+        slots:
+          type: array
+          items:
+            $ref: '#/components/schemas/Slot'
+          readOnly: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - created_at
+      - date
+      - day_template
+      - slots
+      - updated_at
+    ScheduleOverrideChange:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date
+        type:
+          $ref: '#/components/schemas/TypeEnum'
+        notes:
+          type: string
+          description: Shown to members, e.g. "Junior club championship until 14:00".
+          maxLength: 500
+        day_template:
+          allOf:
+          - $ref: '#/components/schemas/TemplateRef'
+          nullable: true
+        slots:
+          type: array
+          items:
+            $ref: '#/components/schemas/Slot'
+          readOnly: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+        cancelled_reservations:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReservationSummary'
+      required:
+      - cancelled_reservations
+      - created_at
+      - date
+      - day_template
+      - slots
+      - updated_at
+    ScheduleOverrideWriteRequest:
+      type: object
+      description: |-
+        {"day_template": "<id>" | null (closed), "type": "TOURNAMENT",
+         "notes": "Junior club championship until 14:00", "force": false}
+      properties:
+        day_template:
+          type: string
+          format: uuid
+          nullable: true
+          description: null = closed that day.
+        type:
+          $ref: '#/components/schemas/TypeEnum'
+        notes:
+          type: string
+          default: ''
+          description: Shown to members.
+          maxLength: 500
+        force:
+          type: boolean
+          default: false
+      required:
+      - day_template
+      - type
+    SignupRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+          minLength: 1
+        first_name:
+          type: string
+          minLength: 1
+          maxLength: 150
+        last_name:
+          type: string
+          minLength: 1
+          maxLength: 150
+        password:
+          type: string
+          writeOnly: true
+          minLength: 1
+          description: 'Optional: without one, log in with codes sent by email.'
+      required:
+      - email
+      - first_name
+      - last_name
+    SkillLevelEnum:
+      enum:
+      - '1.0'
+      - '1.5'
+      - '2.0'
+      - '2.5'
+      - '3.0'
+      - '3.5'
+      - '4.0'
+      - '4.5'
+      - '5.0'
+      - '5.5'
+      - '7.0'
+      type: string
+      description: |-
+        * `1.0` - 1.0 – Beginner
+        * `1.5` - 1.5
+        * `2.0` - 2.0
+        * `2.5` - 2.5
+        * `3.0` - 3.0
+        * `3.5` - 3.5
+        * `4.0` - 4.0
+        * `4.5` - 4.5
+        * `5.0` - 5.0
+        * `5.5` - 5.5
+        * `7.0` - 7.0 – Tour / Pro
+    Slot:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+          description: The slot's id (e.g. to link a booking rule to it).
+        start:
+          type: string
+          format: time
+        end:
+          type: string
+          format: time
+          description: Use "24:00" for a slot ending at midnight.
+      required:
+      - end
+      - id
+      - start
+    SlotRequest:
+      type: object
+      properties:
+        start:
+          type: string
+          format: time
+        end:
+          type: string
+          format: time
+          description: Use "24:00" for a slot ending at midnight.
+      required:
+      - end
+      - start
+    StateEnum:
+      type: string
+      enum:
+      - upcoming
+      - pending_payment
+      - completed
+      - cancelled
+      - expired
+    StatusEnum:
+      enum:
+      - PENDING_PAYMENT
+      - CONFIRMED
+      - CANCELLED
+      - COMPLETED
+      - EXPIRED
+      type: string
+      description: |-
+        * `PENDING_PAYMENT` - Pending payment
+        * `CONFIRMED` - Confirmed
+        * `CANCELLED` - Cancelled
+        * `COMPLETED` - Completed
+        * `EXPIRED` - Expired
+    SurfaceTypeEnum:
+      enum:
+      - CLAY
+      - HARD
+      - GRASS
+      - SYNTHETIC
+      type: string
+      description: |-
+        * `CLAY` - Clay
+        * `HARD` - Hard
+        * `GRASS` - Grass
+        * `SYNTHETIC` - Synthetic
+    TemplateRef:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        name:
+          type: string
+          maxLength: 100
+      required:
+      - id
+      - name
+    TimeSlot:
+      type: object
+      description: |-
+        Slot boundaries as ISO-8601 in the club's own timezone (offset included),
+        and the ids of the booking rules that cover it (see the court's `booking_rules`).
+      properties:
+        start:
+          type: string
+          format: date-time
+          readOnly: true
+        end:
+          type: string
+          format: date-time
+          readOnly: true
+        rules:
+          type: array
+          items:
+            type: string
+            format: uuid
+          readOnly: true
+      required:
+      - end
+      - rules
+      - start
+    TypeEnum:
+      enum:
+      - MAINTENANCE
+      - WEATHER
+      - TOURNAMENT
+      - EVENT
+      - HOLIDAY
+      - OTHER
+      type: string
+      description: |-
+        * `MAINTENANCE` - Maintenance
+        * `WEATHER` - Weather
+        * `TOURNAMENT` - Tournament
+        * `EVENT` - Event
+        * `HOLIDAY` - Holiday
+        * `OTHER` - Other
+    UnlinkReport:
+      type: object
+      description: Booking rules a forced deletion unlinked, and those deactivated
+        rather than widened.
+      properties:
+        unlinked_booking_rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuleRef'
+        deactivated_booking_rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuleRef'
+          description: 'Left without any link of a kind they had: deactivated instead
+            of covering more.'
+      required:
+      - deactivated_booking_rules
+      - unlinked_booking_rules
+    WeekdaysAssignmentRequest:
+      type: object
+      description: '{"weekdays": ["MONDAY", ..., "FRIDAY"], "day_template": "<id>"
+        | null (closed)}'
+      properties:
+        weekdays:
+          type: array
+          items:
+            $ref: '#/components/schemas/WeekdaysEnum'
+        day_template:
+          type: string
+          format: uuid
+          nullable: true
+      required:
+      - day_template
+      - weekdays
+    WeekdaysEnum:
+      type: string
+      enum:
+      - MONDAY
+      - TUESDAY
+      - WEDNESDAY
+      - THURSDAY
+      - FRIDAY
+      - SATURDAY
+      - SUNDAY
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: sessionid

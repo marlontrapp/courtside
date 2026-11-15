@@ -116,10 +116,26 @@ def describe_day(day_slots: list[Slot], limit: int = 6) -> str:
 
 @dataclass
 class Resolved:
-    """resolve() result: slots per court and date, and the overrides that applied."""
+    """
+    resolve() result: slots per court and date, the day template each court
+    uses each date (None = closed), each template's slot rows, and the
+    overrides that applied.
+    """
 
     slots: dict[UUID, dict[date, list[Slot]]]
     overrides: dict[UUID, list[ScheduleOverride]]  # per court, by date
+    templates: dict[UUID, dict[date, UUID | None]]
+    template_slots: dict[UUID, list[tuple[UUID, time, time]]]  # template -> (slot id, start, end), by start
+
+    def covered(self, court_id: UUID, day: date, start: time, end: time) -> tuple[UUID | None, frozenset[UUID]]:
+        """The day template `court_id` uses on `day`, and the ids of its slots overlapping [start, end)."""
+        template_id = self.templates[court_id][day]
+        if template_id is None:
+            return None, frozenset()
+        return template_id, frozenset(
+            slot_id for slot_id, slot_start, slot_end in self.template_slots[template_id]
+            if slot_start < end and slot_end > start
+        )
 
 
 def resolve_slots(
@@ -149,20 +165,24 @@ def resolve(courts: Iterable[Court], date_from: date, date_to: date) -> Resolved
     template_ids = {d.day_template_id for v in versions for d in v.days.all()}
     template_ids |= {tid for tid in overrides.values() if tid}
     slots_by_template: dict[UUID, list[Slot]] = defaultdict(list)
-    for template_id, start, end in (
+    slot_rows: dict[UUID, list[tuple[UUID, time, time]]] = defaultdict(list)
+    for slot_id, template_id, start, end in (
         DayTemplateSlot.objects.filter(template_id__in=template_ids)
         .order_by("start_time")
-        .values_list("template_id", "start_time", "end_time")
+        .values_list("id", "template_id", "start_time", "end_time")
     ):
         slots_by_template[template_id].append((start, end))
+        slot_rows[template_id].append((slot_id, start, end))
 
     versions_by_court: dict[UUID, list[CourtSchedule]] = defaultdict(list)
     for version in versions:
         versions_by_court[version.court_id].append(version)
 
     resolved: dict[UUID, dict[date, list[Slot]]] = {}
+    templates: dict[UUID, dict[date, UUID | None]] = {}
     for court_id in court_ids:
         per_day: dict[date, list[Slot]] = {}
+        templates[court_id] = {}
         day = date_from
         while day <= date_to:
             if (court_id, day) in overrides:
@@ -173,12 +193,13 @@ def resolve(courts: Iterable[Court], date_from: date, date_to: date) -> Resolved
                     (d.day_template_id for d in version.days.all() if d.weekday == day.weekday()), None
                 ) if version else None
             per_day[day] = list(slots_by_template[template_id]) if template_id else []
+            templates[court_id][day] = template_id
             day += timedelta(days=1)
         resolved[court_id] = per_day
     overrides_by_court: dict[UUID, list[ScheduleOverride]] = defaultdict(list)
     for override in override_rows:
         overrides_by_court[override.court_id].append(override)
-    return Resolved(slots=resolved, overrides=overrides_by_court)
+    return Resolved(slots=resolved, overrides=overrides_by_court, templates=templates, template_slots=dict(slot_rows))
 
 
 def day_slots(court: Court, day: date) -> list[Slot]:

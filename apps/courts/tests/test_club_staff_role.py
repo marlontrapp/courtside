@@ -251,7 +251,7 @@ class ClubStaffRoleClubInlineTests(TestCase):
         data = {
             "name": self.club.name, "slug": self.club.slug, "timezone": self.club.timezone,
             "address": self.club.address, "cancellation_window_hours": "24", "is_active": "on",
-            "access_type": "OPEN",
+            "access_type": "OPEN", "approval_status": "APPROVED", "rejection_reason": "",
             "courts-TOTAL_FORMS": "0", "courts-INITIAL_FORMS": "0",
             "memberships-TOTAL_FORMS": "0", "memberships-INITIAL_FORMS": "0",
             "staff_roles-TOTAL_FORMS": str(len(rows)), "staff_roles-INITIAL_FORMS": str(initial),

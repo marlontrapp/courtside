@@ -11,7 +11,7 @@ ARGS ?=
 
 .DEFAULT_GOAL := help
 
-.PHONY: help setup run stop seed seed-reset deps test test-fast smoke db-start db-stop db-status db-shell \
+.PHONY: help setup run stop seed seed-reset deps test test-fast smoke openapi db-start db-stop db-status db-shell \
         db-reset clean install-postgres install-redis
 
 help: ## Show this help
@@ -48,6 +48,9 @@ test: ## Run the test suite (TEST=apps.bookings ARGS="-v 2")
 
 smoke: ## Smoke-test the `make run` stack over HTTP (starts/stops it if not running)
 	@$(SCRIPT) smoke $(ARGS)
+
+openapi: ## Generate the OpenAPI schema from the views into docs/openapi.yaml
+	@$(SCRIPT) openapi
 
 test-fast: ## Run tests reusing the test DB, in parallel
 	@$(SCRIPT) test $(TEST) --keepdb --parallel $(ARGS)

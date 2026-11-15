@@ -5,8 +5,14 @@ from datetime import date
 from django.urls import path, register_converter
 
 from .views import (
+    ClubApproveView,
+    ClubCourtDetailView,
+    ClubCourtListView,
     ClubDetailView,
+    ClubPendingListView,
+    ClubRejectView,
     ClubRegistrationView,
+    ClubSearchView,
     CourtListView,
     CourtScheduleCopyView,
     CourtScheduleDetailView,
@@ -34,7 +40,13 @@ app_name = "courts"
 
 urlpatterns = [
     path("clubs/", ClubRegistrationView.as_view(), name="club-register"),
+    path("clubs/search/", ClubSearchView.as_view(), name="club-search"),
+    path("clubs/pending/", ClubPendingListView.as_view(), name="club-pending"),
+    path("clubs/<uuid:pk>/approve/", ClubApproveView.as_view(), name="club-approve"),
+    path("clubs/<uuid:pk>/reject/", ClubRejectView.as_view(), name="club-reject"),
     path("clubs/<uuid:pk>/", ClubDetailView.as_view(), name="club-detail"),
+    path("clubs/<uuid:club_pk>/courts/", ClubCourtListView.as_view(), name="club-court-list"),
+    path("clubs/<uuid:club_pk>/courts/<uuid:pk>/", ClubCourtDetailView.as_view(), name="club-court-detail"),
     path("clubs/<uuid:club_pk>/day-templates/", DayTemplateListView.as_view(), name="day-template-list"),
     path("clubs/<uuid:club_pk>/day-templates/<uuid:pk>/", DayTemplateDetailView.as_view(), name="day-template-detail"),
     path("courts/", CourtListView.as_view(), name="court-list"),

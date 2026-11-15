@@ -17,10 +17,12 @@ from apps.common.tests.factories import (
     create_club_membership,
     create_court,
     create_members_only_club,
+    create_player_profile,
     create_reservation,
     create_user,
 )
 from apps.common.tests.utils import FrozenTimeMixin
+from apps.users.models import User
 
 SAO_PAULO = ZoneInfo("America/Sao_Paulo")
 LISBON = ZoneInfo("Europe/Lisbon")
@@ -87,7 +89,9 @@ class CreateReservationTests(ReservationAPITestCase):
         self.assertEqual(body["start"], "2030-01-08T18:00:00-03:00")
         self.assertEqual(body["end"], "2030-01-08T19:00:00-03:00")
         self.assertEqual(body["total_price"], "120.00")  # 100 + 20 lighting
-        self.assertEqual(body["guests"], ["friend@example.com"])
+        self.assertEqual(body["guests"], [{"id": str(self.friend.pk), "first_name": "", "last_name": ""}])
+        self.assertEqual(body["primary_player"], {"id": str(self.player.pk), "first_name": "", "last_name": ""})
+        self.assertNotIn("@", response.content.decode())  # no player email anywhere
         self.assertEqual(body["booking_type"], "SINGLES")
         self.assertEqual(body["court"]["id"], str(self.court.id))
         self.assertEqual(body["court"]["club"]["name"], "Open Club")
@@ -259,4 +263,86 @@ class RequestValidationTests(ReservationAPITestCase):
         response = self.book(guests=["FRIEND@example.com", "friend@example.com"])
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
-        self.assertEqual(response.data["guests"], ["friend@example.com"])
+        self.assertEqual([guest["id"] for guest in response.data["guests"]], [str(self.friend.pk)])
+
+
+class GuestsByPlayerIdTests(ReservationAPITestCase):
+    """Guests can be given by player id (user id, as in the player search) as well as by email."""
+
+    def booked_guests(self) -> set:
+        return set(Reservation.objects.get().guests.all())
+
+    def test_guest_by_id(self):
+        response = self.book(guests=[str(self.friend.pk)])
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(self.booked_guests(), {self.friend})
+
+    def test_ids_and_emails_can_be_mixed(self):
+        third = create_user(email="third@example.com")
+
+        response = self.book(guests=["friend@example.com", str(third.pk)])
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(self.booked_guests(), {self.friend, third})
+
+    def test_id_format_is_lenient(self):
+        response = self.book(guests=[f"  {str(self.friend.pk).upper()} "])
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(self.booked_guests(), {self.friend})
+
+    def test_same_player_by_email_and_by_id_is_one_guest(self):
+        response = self.book(guests=["Friend@example.com", str(self.friend.pk), str(self.friend.pk)])
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(Reservation.objects.get().guests.count(), 1)
+
+    def test_unknown_id(self):
+        unknown = "00000000-0000-4000-8000-000000000000"
+
+        response = self.book(guests=[unknown])
+
+        self.assert_error(response, status.HTTP_400_BAD_REQUEST, f"No registered player with id: {unknown}.", field="guests")
+        self.assertFalse(Reservation.objects.exists())
+
+    def test_unknown_email_and_id_are_both_reported(self):
+        unknown = "00000000-0000-4000-8000-000000000000"
+
+        response = self.book(guests=["nobody@example.com", unknown, str(self.friend.pk)])
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            [str(e) for e in response.data["guests"]],
+            ["No registered player with email: nobody@example.com.", f"No registered player with id: {unknown}."],
+        )
+
+    def test_self_by_id(self):
+        self.assert_error(
+            self.book(guests=[str(self.player.pk)]), status.HTTP_400_BAD_REQUEST, "yourself", field="guests"
+        )
+
+    def test_entries_that_are_neither_id_nor_email(self):
+        response = self.book(guests=["not-a-player", "1234", str(self.friend.pk)])
+
+        self.assert_error(
+            response, status.HTTP_400_BAD_REQUEST, "Not a player id or email: 'not-a-player', '1234'.", field="guests"
+        )
+
+    def test_at_most_three_guests_of_any_kind(self):
+        guests = [str(create_user().pk) for _ in range(2)] + [create_user().email for _ in range(2)]
+
+        response = self.book(guests=guests)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("guests", response.data)
+
+    def test_book_with_a_player_found_by_the_search(self):
+        create_player_profile(user=self.friend, location="Lisboa")
+        User.objects.filter(pk=self.friend.pk).update(first_name="Fernanda", last_name="Amiga")
+
+        found = self.client.get(reverse("users:player-search"), {"q": "fernanda"}).data["results"]
+        response = self.book(booking_type="DOUBLES", guests=[found[0]["id"]])
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(self.booked_guests(), {self.friend})

@@ -37,6 +37,10 @@ CELERY_RESULT_BACKEND = "cache+memory://"
 # Capture outgoing mail in django.core.mail.outbox instead of sending.
 EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"
 
+# Auth endpoints: no per-IP throttling in general (tests log in a lot from one
+# "IP"); the throttling tests lower it explicitly.
+AUTH_THROTTLE_RATE = "10000/min"
+
 # --- Static files ----------------------------------------------------------
 # The WhiteNoise manifest storage requires `collectstatic` to have run;
 # plain storage avoids that requirement when rendering admin pages in tests.
@@ -45,6 +49,12 @@ STORAGES["staticfiles"] = {  # noqa: F405
 }
 # Serve static files from app dirs without a pre-built STATIC_ROOT.
 WHITENOISE_AUTOREFRESH = True
+
+# --- Uploaded files --------------------------------------------------------
+# Keep uploads in memory: nothing written to disk, nothing left behind.
+STORAGES["player_pictures"] = {  # noqa: F405
+    "BACKEND": "django.core.files.storage.InMemoryStorage",
+}
 
 # --- Noise reduction -------------------------------------------------------
 LOGGING["root"]["level"] = "CRITICAL"  # noqa: F405

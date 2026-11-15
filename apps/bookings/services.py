@@ -18,6 +18,7 @@ from apps.courts.services import can_access_club
 from apps.users.models import User
 
 from .models import Reservation
+from .rules import BookingAttempt, booking_rule_violations
 from .tasks import send_booking_cancellation_task, send_booking_confirmation_task
 
 logger = logging.getLogger(__name__)
@@ -92,6 +93,8 @@ def validate_slot(
 
     if not court.club.is_active:
         errors.append("Club is not active.")
+    elif not court.club.is_approved:
+        errors.append("Club is awaiting approval: it can't be booked yet.")
 
     if end > start:
         errors.extend(_schedule_errors(court, start, end))
@@ -145,6 +148,7 @@ def create_reservation(
     guests: list[User] | None = None,
     notes: str = "",
     status: str = Reservation.Status.PENDING_PAYMENT,
+    enforce_rules: bool = True,
 ) -> Reservation:
     """
     Validate and create a reservation.
@@ -154,6 +158,11 @@ def create_reservation(
 
     Members-only clubs: the primary player must hold an active membership.
     Guests are not checked (members may bring non-member guests).
+
+    Singles courts (Court.is_singles_only): no doubles, at most 2 players.
+
+    The club's booking rules (apps.bookings.rules) must all be met; every
+    broken rule is reported. `enforce_rules=False` skips them (staff tools).
     """
     if not can_access_club(primary_player, court.club):
         raise BookingError("This court is restricted to club members.")
@@ -164,6 +173,33 @@ def create_reservation(
 
     if includes_lighting and not court.has_lighting:
         raise BookingError("This court does not support lighting.")
+
+    if court.is_singles_only:  # a property of the court, not a booking rule
+        problems = []
+        if booking_type == Reservation.BookingType.DOUBLES:
+            problems.append("This is a singles court: doubles can't be booked here.")
+        if 1 + len(guests or ()) > Court.MAX_SINGLES_PLAYERS:
+            problems.append(
+                f"This is a singles court: at most {Court.MAX_SINGLES_PLAYERS} players (you and 1 guest)."
+            )
+        if problems:
+            raise BookingError(*problems)
+
+    if enforce_rules:
+        violations = booking_rule_violations(
+            BookingAttempt(
+                club=court.club,
+                court=court,
+                booker=primary_player,
+                guests=tuple(guests or ()),
+                booking_type=booking_type,
+                start=start_datetime,
+                end=end_datetime,
+                now=timezone.now(),
+            )
+        )
+        if violations:
+            raise BookingError(*violations)
 
     total_price = calculate_total_price(
         court,

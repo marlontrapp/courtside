@@ -12,7 +12,10 @@ from apps.bookings.availability import AvailabilityWindow, get_courts_availabili
 from apps.bookings.models import Reservation
 from apps.bookings.services import expire_stale_pending_reservations
 from apps.bookings.tasks import send_upcoming_match_reminder_task
-from apps.common.seed import CLUBS, PLAYERS, SEED_NOTE, SEED_PASSWORD, seed
+from apps.bookings.models import BookingRule
+from apps.bookings.rules import RULE_KINDS
+from apps.bookings.services import BookingError, create_reservation
+from apps.common.seed import CLUBS, PLAYERS, RULES, SEED_NOTE, SEED_PASSWORD, seed
 from apps.common.tests.utils import FrozenTimeMixin, freeze_time
 from apps.courts.models import Club, ClubMembership, Court, ScheduleOverride
 from apps.courts.services import get_bookable_courts, get_visible_clubs
@@ -121,6 +124,35 @@ class SeedContentTests(SeedTestCase):
         booking = Reservation.objects.get(notes__contains="evening singles with lighting")
 
         self.assertEqual(booking.total_price, Decimal("150.00"))  # 120 + 30 lighting
+
+
+class SeedBookingRuleTests(SeedTestCase):
+    def test_example_rules(self):
+        self.assertEqual(self.result.rules_created, len(RULES))
+        for spec in RULES:
+            with self.subTest(spec.name):
+                rule = BookingRule.objects.get(name=spec.name)
+                self.assertEqual(rule.params, RULE_KINDS[spec.kind].validate_params(spec.params))
+                self.assertEqual(sorted(c.name for c in rule.courts.all()), sorted(spec.courts))
+                self.assertEqual(sorted(s.start_time for s in rule.slots.all()), sorted(spec.slots))
+
+    def test_womens_evening_is_enforced(self):
+        court = Court.objects.select_related("club").get(name="Court 1 - Guga")
+        thursday = NOW.date() + timedelta(days=3)
+        window = AvailabilityWindow.for_date(thursday, time_from=time(19), time_to=time(21))
+        slot = get_courts_availability([court], window)[court.pk][0]  # a free women's-evening slot
+
+        with self.assertRaisesMessage(BookingError, "Women's evening: women only."):
+            create_reservation(court=court, primary_player=self.user("bruno"), start_datetime=slot.start, end_datetime=slot.end)
+        create_reservation(court=court, primary_player=self.user("ana"), start_datetime=slot.start, end_datetime=slot.end)
+
+    def test_rerun_keeps_edited_rules(self):
+        BookingRule.objects.filter(name="Women's evening").update(is_active=False)
+
+        result = seed()
+
+        self.assertEqual(result.rules_created, 0)
+        self.assertFalse(BookingRule.objects.get(name="Women's evening").is_active)
 
 
 class SeedIdempotencyTests(SeedTestCase):

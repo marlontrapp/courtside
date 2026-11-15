@@ -3,7 +3,7 @@
 from unittest import mock
 
 from django.db import IntegrityError
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -42,6 +42,8 @@ class ClubRegistrationAPITests(APITestCase):
                 "access_type": "OPEN",
                 "cancellation_window_hours": 24,
                 "is_active": True,
+                "approval_status": "PENDING",  # self-service: awaiting approval (see test_club_approval.py)
+                "rejection_reason": "",
                 "created_at": response.data["created_at"],
                 "updated_at": response.data["updated_at"],
             },
@@ -100,6 +102,7 @@ class ClubRegistrationAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("name", response.data)
 
+    @override_settings(CLUB_REGISTRATION_MAX_PENDING=10)  # one user registers 4 clubs here
     def test_duplicate_names_fall_back_to_address_then_numbers(self):
         slugs = [
             self.post({"name": "Tennis Club", "address": address}).data["slug"]

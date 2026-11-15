@@ -38,8 +38,8 @@ class MyReservationsTestCase(FrozenTimeMixin, APITestCase):
 
     @classmethod
     def setUpTestData(cls):
-        cls.me = create_user(email="me@example.com")
-        cls.friend = create_user(email="friend@example.com")
+        cls.me = create_user(email="me@example.com", first_name="Maria", last_name="Eu")
+        cls.friend = create_user(email="friend@example.com", first_name="Fábio", last_name="Amigo")
         cls.stranger = create_user(email="stranger@example.com")
 
         cls.alpha = create_club(name="Alpha")
@@ -148,8 +148,8 @@ class PayloadTests(MyReservationsTestCase):
         self.assertEqual(item["end"], "2030-01-08T19:00:00-03:00")
         self.assertEqual(item["status"], "CONFIRMED")
         self.assertEqual(item["state"], "upcoming")
-        self.assertEqual(item["primary_player"], "me@example.com")
-        self.assertEqual(item["guests"], ["friend@example.com"])
+        self.assertEqual(item["primary_player"], {"id": str(self.me.pk), "first_name": "Maria", "last_name": "Eu"})
+        self.assertEqual(item["guests"], [{"id": str(self.friend.pk), "first_name": "Fábio", "last_name": "Amigo"}])
         self.assertEqual(item["court"]["name"], "A1")
         self.assertEqual(item["court"]["club"]["name"], "Alpha")
 
@@ -273,6 +273,18 @@ class OtherFilterTests(MyReservationsTestCase):
     def test_player_matches_booker_or_guest(self):
         # friend is a guest in "upcoming" and the booker of "as_guest".
         self.assertEqual(self.names(player="friend@example.com"), {"upcoming", "as_guest"})
+
+    def test_player_by_id(self):
+        self.assertEqual(self.names(player=str(self.friend.pk)), {"upcoming", "as_guest"})
+
+    def test_player_ids_and_emails_can_be_mixed(self):
+        stranger = create_user()
+        self.assertEqual(self.names(player=f"{stranger.pk},FRIEND@example.com"), {"upcoming", "as_guest"})
+        self.assertEqual(self.names(player=f" {str(self.friend.pk).upper()} "), {"upcoming", "as_guest"})
+
+    def test_player_entries_that_are_neither_match_nothing(self):
+        self.assertEqual(self.names(player="not-a-player"), set())
+        self.assertEqual(self.names(player="not-a-player,friend@example.com"), {"upcoming", "as_guest"})
 
     def test_player_is_case_insensitive_and_multi_valued(self):
         self.assertEqual(

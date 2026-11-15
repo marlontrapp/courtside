@@ -26,7 +26,8 @@ from zoneinfo import ZoneInfo
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from apps.bookings.models import Reservation
+from apps.bookings.models import BookingRule, Reservation
+from apps.bookings.rules import RULE_KINDS
 from apps.bookings.services import calculate_total_price
 from apps.courts.models import (
     Club,
@@ -70,6 +71,7 @@ class CourtSpec:
     rate: str = "100.00"
     lighting_fee: str = "0.00"
     active: bool = True
+    singles: bool = False  # a singles court: no doubles, at most 2 players
 
 
 @dataclass(frozen=True)
@@ -99,7 +101,7 @@ CLUBS: tuple[ClubSpec, ...] = (
             CourtSpec("Court 1 - Guga", CLAY, rate="120.00", lighting_fee="30.00"),
             CourtSpec("Court 2 - Maria Esther", CLAY, rate="120.00", lighting_fee="30.00"),
             CourtSpec("Court 3 - Indoor", HARD, indoor=True, rate="150.00"),
-            CourtSpec("Court 4 - Day Court", HARD, lighting=False, rate="90.00"),
+            CourtSpec("Court 4 - Day Court", HARD, lighting=False, rate="90.00", singles=True),
             CourtSpec("Court 5 - Under renovation", CLAY, active=False),
         ),
     ),
@@ -173,24 +175,51 @@ class PlayerSpec:
     skill: str
     story: str
     memberships: tuple[MembershipSpec, ...] = ()
+    location: str = ""
+    gender: str = ""
 
 
 PLAYERS: tuple[PlayerSpec, ...] = (
     PlayerSpec("ana@example.com", "Ana", "Souza", "3.0",
-               "no memberships: sees open clubs only"),
+               "no memberships: sees open clubs only",
+               location="Pinheiros, São Paulo - SP, Brasil", gender="FEMALE"),
     PlayerSpec("bruno@example.com", "Bruno", "Lima", "4.0",
                "member of Jardins",
-               (MembershipSpec("jardins", tier=PREMIUM),)),
+               (MembershipSpec("jardins", tier=PREMIUM),),
+               location="Jardins, São Paulo - SP, Brasil", gender="MALE"),
     PlayerSpec("carla@example.com", "Carla", "Mendes", "4.5",
                "member of Jardins AND Morumbi (multi-club)",
                (MembershipSpec("jardins", tier=VIP),
-                MembershipSpec("morumbi", expires_in_days=365))),
+                MembershipSpec("morumbi", expires_in_days=365)),
+               location="Morumbi, São Paulo - SP, Brasil", gender="FEMALE"),
     PlayerSpec("diego@example.com", "Diego", "Rocha", "2.5",
                "SUSPENDED at Jardins: sees open clubs only",
-               (MembershipSpec("jardins", status=SUSPENDED),)),
+               (MembershipSpec("jardins", status=SUSPENDED),),
+               location="Niterói - RJ, Brasil", gender="MALE"),
     PlayerSpec("elena@example.com", "Elena", "Costa", "3.5",
                "EXPIRED at Morumbi: sees open clubs only",
-               (MembershipSpec("morumbi", expires_in_days=-1),)),
+               (MembershipSpec("morumbi", expires_in_days=-1),),
+               location="Alfama, Lisboa, Portugal", gender="FEMALE"),
+)
+
+
+@dataclass(frozen=True)
+class RuleSpec:
+    club: str  # ClubSpec.key
+    name: str
+    kind: str
+    params: dict
+    courts: tuple[str, ...] = ()  # court names; empty = every court
+    slots: tuple[time, ...] = ()  # start times of slots of the club's seed day template; empty = any
+
+
+# One example of each kind of situation (see apps/bookings/rules.py).
+RULES: tuple[RuleSpec, ...] = (
+    RuleSpec("ibirapuera", "Women's evening", "player_gender", {"allowed": ["FEMALE"]},
+             courts=("Court 1 - Guga", "Court 2 - Maria Esther"), slots=(time(19), time(20))),
+    RuleSpec("jardins", "Prime time: 1 a week", "max_bookings_per_period", {"max": 1, "period": "week"},
+             slots=(time(18), time(19), time(20), time(21))),
+    RuleSpec("morumbi", "One upcoming booking", "max_active_bookings", {"max": 1, "counts": "club"}),
 )
 
 
@@ -202,6 +231,7 @@ class SeedResult:
     memberships_created: int = 0
     reservations_created: int = 0
     overrides_created: int = 0
+    rules_created: int = 0
     skipped_conflicts: list[str] = field(default_factory=list)
 
 
@@ -214,10 +244,14 @@ def seed(*, reset: bool = False, now: datetime | None = None) -> SeedResult:
 
     manager = _ensure_user(result, MANAGER_EMAIL, "Club", "Manager")
     players = {
-        spec.email: _ensure_user(result, spec.email, spec.first_name, spec.last_name, skill=spec.skill)
+        spec.email: _ensure_user(
+            result, spec.email, spec.first_name, spec.last_name,
+            skill=spec.skill, location=spec.location, gender=spec.gender,
+        )
         for spec in PLAYERS
     }
     clubs, courts = _ensure_clubs(result)
+    _ensure_rules(result, clubs, courts)
     _ensure_admin_roles(manager, clubs)
     _ensure_memberships(result, players, clubs, now)
     _refresh_schedule(result, players, manager, clubs, courts, now)
@@ -238,7 +272,7 @@ def delete_seed_data() -> None:
 # --- static data (create-if-missing) ----------------------------------------------
 
 
-def _ensure_user(result: SeedResult, email, first_name, last_name, *, skill=None) -> User:
+def _ensure_user(result: SeedResult, email, first_name, last_name, *, skill=None, location="", gender="") -> User:
     user = User.objects.filter(email=email).first()
     if user is None:
         user = User.objects.create_user(
@@ -248,7 +282,7 @@ def _ensure_user(result: SeedResult, email, first_name, last_name, *, skill=None
     if skill is not None:
         PlayerProfile.objects.get_or_create(
             user=user,
-            defaults={"skill_level": skill, "phone_number": "+55 11 90000-0000"},
+            defaults={"skill_level": skill, "phone_number": "+55 11 90000-0000", "location": location, "gender": gender},
         )
     return user
 
@@ -276,6 +310,7 @@ def _ensure_clubs(result: SeedResult) -> tuple[dict[str, Club], dict[tuple[str, 
                 defaults={
                     "surface_type": court_spec.surface,
                     "is_indoor": court_spec.indoor,
+                    "is_singles_only": court_spec.singles,
                     "has_lighting": court_spec.lighting,
                     "hourly_rate": Decimal(court_spec.rate),
                     "lighting_fee": Decimal(court_spec.lighting_fee),
@@ -307,6 +342,22 @@ def _day_template(club: Club, spec) -> DayTemplate:
             for start, end in grid_slots(spec.open_at, spec.close_at, spec.slot_minutes)
         )
     return template
+
+
+def _ensure_rules(result: SeedResult, clubs, courts) -> None:
+    """Example booking rules, created if missing (by club + name): edits are kept on re-runs."""
+    for spec in RULES:
+        club = clubs[spec.club]
+        rule, created = BookingRule.objects.get_or_create(
+            club=club, name=spec.name,
+            defaults={"kind": spec.kind, "params": RULE_KINDS[spec.kind].validate_params(spec.params)},
+        )
+        if created:
+            rule.courts.set(courts[(spec.club, name)] for name in spec.courts)
+            if spec.slots:
+                template = _day_template(club, next(c for c in CLUBS if c.key == spec.club))
+                rule.slots.set(template.slots.filter(start_time__in=spec.slots))
+            result.rules_created += 1
 
 
 def _ensure_admin_roles(manager: User, clubs) -> None:
