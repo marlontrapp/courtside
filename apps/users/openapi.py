@@ -19,6 +19,7 @@ from .serializers import (
     ChallengeSerializer,
     CodeSerializer,
     EmailSerializer,
+    MeSerializer,
     PasswordLoginSerializer,
     PasswordResetConfirmSerializer,
     PictureUploadSerializer,
@@ -231,6 +232,10 @@ auth_logout = extend_schema_view(post=extend_schema(
 
 me = extend_schema_view(get=extend_schema(
     tags=PROFILE, summary="My account",
-    description="The logged-in user's account — the only endpoint returning a user's email (their own).",
-    responses={200: AccountSerializer, 403: NOT_LOGGED_IN},
+    description=(
+        "The signed-in user and how they can act: player profile flag, site staff flag, "
+        "and the clubs they can work in with today's staff roles. Still the only endpoint "
+        "returning a user's email (their own)."
+    ),
+    responses={200: MeSerializer, 403: NOT_LOGGED_IN},
 ))

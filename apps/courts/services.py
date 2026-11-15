@@ -326,6 +326,29 @@ def get_administered_clubs(user) -> QuerySet[Club]:
     )
 
 
+def get_working_clubs(user) -> list[tuple[Club, list[str]]]:
+    """
+    The clubs `user` can work in, by name, each with the staff roles they hold
+    there today (ClubStaffRole.Role values, in declaration order: admin,
+    groundskeeper, front desk). Site staff (`is_staff`) can work in every club
+    (active or not); clubs where they hold no role come with an empty list.
+    """
+    if user is None or not getattr(user, "is_authenticated", False):
+        return []
+    order = {value: index for index, value in enumerate(ClubStaffRole.Role.values)}
+    clubs: dict = {}
+    for role in ClubStaffRole.objects.current().filter(user=user).select_related("club"):
+        roles = clubs.setdefault(role.club_id, (role.club, []))[1]
+        if role.role not in roles:
+            roles.append(role.role)
+    if user.is_staff:
+        for club in Club.objects.all():
+            clubs.setdefault(club.pk, (club, []))
+    for _, roles in clubs.values():
+        roles.sort(key=order.__getitem__)
+    return sorted(clubs.values(), key=lambda entry: (entry[0].name.lower(), str(entry[0].pk)))
+
+
 def get_administered_courts(user) -> QuerySet[Court]:
     """Every court (active or not) of the clubs `user` administers."""
     if user is None or not getattr(user, "is_authenticated", False):

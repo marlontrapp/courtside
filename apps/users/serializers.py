@@ -5,6 +5,9 @@ from rest_framework import serializers
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 
+from apps.courts.models import Club
+from apps.courts.services import get_working_clubs
+
 from .auth import validate_signup_password
 from .models import PlayerProfile, User
 from .services import picture_url
@@ -74,6 +77,46 @@ class AccountSerializer(serializers.ModelSerializer):
 
     def get_has_password(self, user) -> bool:
         return user.has_usable_password()
+
+
+class WorkingClubSerializer(serializers.ModelSerializer):
+    """A club the user can work in, with their current staff roles there."""
+
+    roles = serializers.SerializerMethodField(
+        help_text="ADMIN | GROUNDSKEEPER | FRONT_DESK held today; empty for site staff without a club role."
+    )
+
+    class Meta:
+        model = Club
+        fields = ["id", "name", "slug", "address", "timezone", "access_type", "is_active", "roles"]
+
+    def get_roles(self, club) -> list[str]:
+        return self.context["roles"][club.pk]
+
+
+class MeSerializer(serializers.ModelSerializer):
+    """
+    The signed-in user: who they are and how they can act — as a player (has a
+    player profile), and/or in the clubs they help run (`clubs`, by name).
+    """
+
+    is_player = serializers.SerializerMethodField()
+    is_site_staff = serializers.BooleanField(source="is_staff", read_only=True)
+    clubs = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = ["id", "email", "first_name", "last_name", "is_player", "is_site_staff", "clubs"]
+
+    def get_is_player(self, user) -> bool:
+        return PlayerProfile.objects.filter(user=user).exists()
+
+    def get_clubs(self, user) -> list[dict]:
+        working = get_working_clubs(user)
+        roles = {club.pk: club_roles for club, club_roles in working}
+        return WorkingClubSerializer(
+            [club for club, _ in working], many=True, context={"roles": roles}
+        ).data
 
 
 class SignupSerializer(serializers.Serializer):
