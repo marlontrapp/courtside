@@ -30,6 +30,7 @@ from .serializers import (
     AccountSerializer,
     CodeSerializer,
     EmailSerializer,
+    MeSerializer,
     PasswordLoginSerializer,
     PasswordResetConfirmSerializer,
     SignupSerializer,
@@ -176,7 +177,19 @@ class LogoutView(AuthView):
 
 @openapi.me
 class MeView(APIView):
-    """The logged-in user's own account (the default: logged-in users only)."""
+    """
+    GET /api/v1/me/ — the signed-in user and how they can act:
+
+        {"id": "<uuid>", "email": "ana@example.com", "first_name": "Ana", "last_name": "Silva",
+         "is_player": true,          # has a player profile
+         "is_site_staff": false,     # site-wide staff: can work in every club
+         "clubs": [                  # clubs they can work in, by name
+            {"id": "<uuid>", "name": "Jardins Country Club", "slug": "…", "address": "…",
+             "timezone": "America/Sao_Paulo", "access_type": "MEMBERS_ONLY", "is_active": true,
+             "roles": ["ADMIN", "FRONT_DESK"]}]}   # staff roles held today
+
+    403 when not signed in.
+    """
 
     def get(self, request):
-        return Response(AccountSerializer(request.user).data)
+        return Response(MeSerializer(request.user).data)

@@ -355,7 +355,14 @@ class Command(BaseCommand):
               f"verify sign-up: {response.describe()}")
         check(User.objects.filter(email=SIGNUP_EMAIL, player_profile__isnull=False).exists(), "account not created")
         response = client.get("/api/v1/me/")
-        check(response.status == 200 and response.json()["has_password"], f"GET /me/: {response.describe()}")
+        me = response.json() if response.status == 200 else {}
+        check(
+            response.status == 200
+            and me.get("email") == SIGNUP_EMAIL
+            and me.get("is_player") is True
+            and isinstance(me.get("clubs"), list),
+            f"GET /me/: {response.describe()}",
+        )
         self._logout(client)
         self._ok("POST /auth/signup/ + /auth/signup/verify/ (logged in), GET /me/, POST /auth/logout/")
 
